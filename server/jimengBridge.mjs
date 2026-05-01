@@ -9,8 +9,51 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// 设置模块查找路径，以便能找到 node_modules
+const modulePaths = [];
+let currentDir = __dirname;
+while (true) {
+  const nodeModulesPath = join(currentDir, 'node_modules');
+  if (existsSync(nodeModulesPath)) {
+    modulePaths.push(nodeModulesPath);
+  }
+  const parentDir = dirname(currentDir);
+  if (parentDir === currentDir) break;
+  currentDir = parentDir;
+}
+
+let require = createRequire(import.meta.url);
+
+import { pathToFileURL } from 'node:url';
+
+// 设置自定义模块路径 - 支持分号分隔的多路径（Windows）
+function setupCustomModulePaths(customNodeModulesPath) {
+  if (!customNodeModulesPath) return;
+  
+  const paths = customNodeModulesPath.split(/[;:]/).filter(Boolean);
+  console.log('设置自定义模块路径:', paths);
+  
+  for (const p of paths) {
+    modulePaths.unshift(p);
+  }
+  
+  const parentAsarNodeModules = join(__dirname, '../node_modules');
+  modulePaths.unshift(parentAsarNodeModules);
+  
+  // createRequire 需要一个存在的文件作为基准
+  // 用 __dirname 下的 package.json（即 server 目录的 package.json）或者用 import.meta.url
+  try {
+    require = createRequire(import.meta.url);
+    console.log('使用 import.meta.url 创建 require');
+  } catch (e) {
+    console.log('创建 require 失败:', e.message);
+  }
+}
+
 const execFileAsync = promisify(execFile);
-const require = createRequire(import.meta.url);
 const DEFAULT_PORT = Number(process.env.JIMENG_BRIDGE_PORT || 3210);
 const appRoot = join(homedir(), '.jimeng-video-desktop');
 const dbPath = join(appRoot, 'app.sqlite');
@@ -40,10 +83,39 @@ let db = null;
 let processingQueue = false;
 
 function openSqliteDatabase(path) {
+  console.log('尝试打开数据库，modulePaths:', modulePaths);
+  
+  // 优先从 unpacked 路径加载 better-sqlite3（原生 .node 模块不能从 asar 内加载）
+  for (const basePath of modulePaths) {
+    if (!basePath.includes('app.asar.unpacked')) continue;
+    try {
+      const tempRequire = createRequire(join(basePath, 'better-sqlite3', 'lib', 'index.js'));
+      const BetterSqlite3 = tempRequire('better-sqlite3');
+      console.log('成功从 unpacked 路径加载 better-sqlite3:', basePath);
+      return new BetterSqlite3(path);
+    } catch (e) {
+      console.log('从 unpacked 路径加载失败:', e.message);
+    }
+  }
+  
+  // 然后尝试其他路径
+  for (const basePath of modulePaths) {
+    try {
+      const tempRequire = createRequire(join(basePath, 'better-sqlite3', 'lib', 'index.js'));
+      const BetterSqlite3 = tempRequire('better-sqlite3');
+      console.log('成功从路径加载 better-sqlite3:', basePath);
+      return new BetterSqlite3(path);
+    } catch (e) {
+      // 继续
+    }
+  }
+  
   try {
     const BetterSqlite3 = require('better-sqlite3');
+    console.log('成功通过默认 require 加载 better-sqlite3');
     return new BetterSqlite3(path);
   } catch (betterSqliteError) {
+    console.log('加载 better-sqlite3 失败:', betterSqliteError.message);
     try {
       const { DatabaseSync } = require('node:sqlite');
       const sqlite = new DatabaseSync(path);
@@ -763,6 +835,10 @@ function configureRoutes(app) {
 }
 
 export async function startJimengBridge(options = {}) {
+  // 如果传入了自定义的 node_modules 路径，先设置它
+  if (options.nodeModulesPath) {
+    setupCustomModulePaths(options.nodeModulesPath);
+  }
   initDb();
   const app = express();
   configureRoutes(app);

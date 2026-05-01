@@ -6,7 +6,13 @@ import { DEFAULT_PROJECT_DEFAULTS } from './shared/types';
 import { MODEL_VERSIONS, modelLabel, normalizeModelVersion } from './shared/jimeng';
 import './styles.css';
 
-const apiBase = '';
+const apiBase = 'http://localhost:3210';
+
+function assetUrl(path: string): string {
+  if (!path) return path;
+  if (path.startsWith('http://') || path.startsWith('https://') || path.startsWith('data:')) return path;
+  return `${apiBase}${path}`;
+}
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${apiBase}${path}`, {
@@ -62,8 +68,8 @@ function StatusPill({ status }: { status: string }) {
 }
 
 function AssetPreview({ asset }: { asset: InputAsset }) {
-  if (asset.kind === 'image') return <img src={asset.previewUrl} alt={asset.name} />;
-  if (asset.kind === 'video') return <video src={asset.previewUrl} muted controls />;
+  if (asset.kind === 'image') return <img src={assetUrl(asset.previewUrl)} alt={asset.name} />;
+  if (asset.kind === 'video') return <video src={assetUrl(asset.previewUrl)} muted controls />;
   return <div className="asset-audio">音频</div>;
 }
 
@@ -785,9 +791,9 @@ function App() {
                 {projectOutputs.map((asset) => (
                   <article key={asset.id} className="output-card">
                     {asset.kind === 'video'
-                      ? <video src={asset.previewUrl} controls />
-                      : <img src={asset.previewUrl} alt={asset.filename} />}
-                    <a href={asset.previewUrl} download>{`分镜 ${asset.sceneNo} · ${asset.filename}`}</a>
+                      ? <video src={assetUrl(asset.previewUrl)} controls />
+                      : <img src={assetUrl(asset.previewUrl)} alt={asset.filename} />}
+                    <a href={assetUrl(asset.previewUrl)} download>{`分镜 ${asset.sceneNo} · ${asset.filename}`}</a>
                   </article>
                 ))}
               </div>
@@ -1125,6 +1131,8 @@ function StoryboardEditor({ storyboard, assets, options, onSave, onEnqueue, onEn
   const [dirty, setDirty] = React.useState(false);
   const [saveState, setSaveState] = React.useState<'idle' | 'saving' | 'saved'>('idle');
   const [showAssetPicker, setShowAssetPicker] = React.useState(false);
+  const [hoveredAsset, setHoveredAsset] = React.useState<InputAsset | null>(null);
+  const hoverTimerRef = React.useRef<NodeJS.Timeout | null>(null);
   const promptRef = React.useRef<HTMLTextAreaElement | null>(null);
 
   React.useEffect(() => {
@@ -1171,7 +1179,7 @@ function StoryboardEditor({ storyboard, assets, options, onSave, onEnqueue, onEn
           {assets.map((asset) => (
             <button
               key={asset.id}
-              className="mini-button"
+              className="mini-button asset-picker-item"
               onMouseDown={(event) => {
                 event.preventDefault();
                 const textarea = promptRef.current;
@@ -1184,10 +1192,34 @@ function StoryboardEditor({ storyboard, assets, options, onSave, onEnqueue, onEn
                 setShowAssetPicker(false);
                 window.setTimeout(() => textarea?.focus(), 0);
               }}
+              onMouseEnter={() => {
+                if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
+                hoverTimerRef.current = setTimeout(() => {
+                  setHoveredAsset(asset);
+                }, 300);
+              }}
+              onMouseLeave={() => {
+                if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
+                setHoveredAsset(null);
+              }}
             >
               @{asset.name}
             </button>
           ))}
+          {hoveredAsset && (
+            <div className="asset-preview-tooltip">
+              {hoveredAsset.kind === 'image' && (
+                <img src={assetUrl(hoveredAsset.previewUrl)} alt={hoveredAsset.name} />
+              )}
+              {hoveredAsset.kind === 'video' && (
+                <video src={assetUrl(hoveredAsset.previewUrl)} muted autoPlay loop playsInline />
+              )}
+              {hoveredAsset.kind === 'audio' && (
+                <div className="asset-audio-preview">音频</div>
+              )}
+              <div className="asset-preview-name">{hoveredAsset.name}</div>
+            </div>
+          )}
         </div>
       )}
       <div className="hint-line">被引用素材会按提示词里 @ 出现顺序上传，并转换为 @图片1 / @视频1 / @音频1。</div>
