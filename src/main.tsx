@@ -586,14 +586,19 @@ function App() {
           </div>
         )}
 
-        <button className={`settings-link ${view === 'settings' ? 'active' : ''}`} onClick={() => setView('settings')}>
-          <Settings size={16} />设置
+        <button className={`settings-link ${view === 'settings' ? 'active' : ''}`} onClick={() => setView(view === 'settings' ? 'workbench' : 'settings')}>
+          <Settings size={16} />{view === 'settings' ? '返回工作台' : '设置'}
         </button>
       </aside>
 
       <section className="main-panel">
         <header className="topbar">
           <div style={{ display: 'flex', alignItems: 'center', gap: '16px', flexWrap: 'wrap' }}>
+            {view === 'settings' && (
+              <button className="mini-button" onClick={() => setView('workbench')}>
+                ← 返回工作台
+              </button>
+            )}
             <div>
               <p>{selectedGroup?.name || '尚未选择分组'}</p>
               <h1>{view === 'settings' ? '设置' : selectedProject?.name || '创建一个项目开始'}</h1>
