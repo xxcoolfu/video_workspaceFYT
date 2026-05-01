@@ -246,7 +246,7 @@ button.secondary, .mini-button {
 
 .prompt-box {
   width: 100%;
-  min-height: 220px;
+  min-height: 380px;
   resize: vertical;
   border: 1px solid #cbd8d5;
   border-radius: 7px;
@@ -283,6 +283,9 @@ button.secondary, .mini-button {
   padding: 6px 9px;
   border-radius: 7px;
   background: #f5f8f7;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .defaults-grid {
