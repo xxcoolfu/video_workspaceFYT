@@ -178,12 +178,43 @@ button.secondary, .mini-button {
   min-height: 30px;
 }
 
+.panel-title-actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.scene-row-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.scene-checkbox {
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+  flex-shrink: 0;
+  accent-color: #186a63;
+}
+
+.scene-checkbox:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.scene-checkbox:disabled:active,
+.scene-checkbox:disabled:hover {
+  opacity: 0.8;
+}
+
 .scene-row {
   width: 100%;
   background: #eef4f2;
   color: #213431;
   justify-content: space-between;
-  margin-bottom: 8px;
+  margin-bottom: 0;
 }
 
 .pill {
@@ -283,9 +314,12 @@ input, select {
   padding-top: 23px;
 }
 
-.checkline input {
-  width: 16px;
-  height: 16px;
+.checkline input,
+.asset-toggle input {
+  width: 14px;
+  height: 14px;
+  accent-color: #186a63;
+  flex-shrink: 0;
 }
 
 .editor-actions, .modal-actions, .settings-actions {

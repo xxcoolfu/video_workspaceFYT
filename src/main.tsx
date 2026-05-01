@@ -81,6 +81,7 @@ function App() {
   const [newDefaults, setNewDefaults] = React.useState<ProjectDefaults>(DEFAULT_PROJECT_DEFAULTS);
   const [savedStoryboardId, setSavedStoryboardId] = React.useState('');
   const [isPolling, setIsPolling] = React.useState(false);
+  const [pendingStoryboards, setPendingStoryboards] = React.useState<Set<string>>(new Set());
 
   const refresh = React.useCallback(async () => {
     setIsPolling(true);
@@ -172,6 +173,25 @@ function App() {
     await mutate('/api/queue/enqueue', { storyboardIds: ready });
   }
 
+  async function enqueuePending() {
+    const ready = Array.from(pendingStoryboards);
+    if (ready.length === 0) return;
+    await mutate('/api/queue/enqueue', { storyboardIds: ready });
+    setPendingStoryboards(new Set());
+  }
+
+  function togglePending(storyboardId: string, hasBeenSubmitted: boolean) {
+    setPendingStoryboards((prev) => {
+      const next = new Set(prev);
+      if (next.has(storyboardId)) {
+        next.delete(storyboardId);
+      } else {
+        next.add(storyboardId);
+      }
+      return next;
+    });
+  }
+
   async function queueAction(task: QueueTask, action: 'retry' | 'delete' | 'cancel-local') {
     try {
       if (action === 'retry') {
@@ -259,18 +279,38 @@ function App() {
               <div className="panel-title">
                 <ListPlus size={17} />
                 <strong>分镜</strong>
-                <button className="mini-button" onClick={() => mutate(`/api/projects/${selectedProject.id}/storyboards`)}>增加</button>
+                <div className="panel-title-actions">
+                  <button className="mini-button" onClick={() => void enqueuePending()}>批量提交</button>
+                  <button className="mini-button" onClick={() => mutate(`/api/projects/${selectedProject.id}/storyboards`)}>增加</button>
+                </div>
               </div>
-              {projectStoryboards.map((storyboard) => (
-                <button
-                  key={storyboard.id}
-                  className={`scene-row ${selectedStoryboard?.id === storyboard.id ? 'active' : ''}`}
-                  onClick={() => setSelectedStoryboardId(storyboard.id)}
-                >
-                  <span>分镜 {storyboard.sceneNo}</span>
-                  <StatusPill status={storyboard.status} />
-                </button>
-              ))}
+              {projectStoryboards.map((storyboard) => {
+                const hasBeenSubmitted = storyboard.status !== 'idle';
+                const isPending = pendingStoryboards.has(storyboard.id);
+                return (
+                  <div key={storyboard.id} className="scene-row-wrapper">
+                    <input
+                      type="checkbox"
+                      className="scene-checkbox"
+                      checked={isPending}
+                      disabled={hasBeenSubmitted}
+                      onChange={() => togglePending(storyboard.id, hasBeenSubmitted)}
+                      onDoubleClick={() => {
+                        if (hasBeenSubmitted) {
+                          togglePending(storyboard.id, hasBeenSubmitted);
+                        }
+                      }}
+                    />
+                    <button
+                      className={`scene-row ${selectedStoryboard?.id === storyboard.id ? 'active' : ''}`}
+                      onClick={() => setSelectedStoryboardId(storyboard.id)}
+                    >
+                      <span>分镜 {storyboard.sceneNo}</span>
+                      <StatusPill status={storyboard.status} />
+                    </button>
+                  </div>
+                );
+              })}
             </section>
 
             <section className="editor panel">
@@ -582,10 +622,6 @@ function StoryboardEditor({ storyboard, assets, options, onSave, onEnqueue, onEn
           await onSave(storyboard, { prompt, assetIds, overrides });
           await onEnqueue();
         }}><Play size={16} />提交当前</button>
-        <button onClick={async () => {
-          await onSave(storyboard, { prompt, assetIds, overrides });
-          await onEnqueueAll();
-        }}>批量提交已写分镜</button>
       </div>
     </>
   );
