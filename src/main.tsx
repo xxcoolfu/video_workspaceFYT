@@ -294,15 +294,14 @@ function App() {
     });
   }
 
-  // 解析CSV文件
+  // 标准CSV解析器，支持引号内换行和引号转义
   function parseCSV(file: File, encoding: 'utf8' | 'gbk'): Promise<any[]> {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = async (e) => {
         try {
           let text = e.target?.result as string;
-          
-          // 如果选择GBK编码，需要用TextDecoder解码
+
           if (encoding === 'gbk' && file.arrayBuffer) {
             const buffer = await file.arrayBuffer();
             try {
@@ -310,50 +309,167 @@ function App() {
               text = decoder.decode(buffer);
             } catch (err) {
               console.log('GBK解码失败，尝试UTF-8', err);
-              // 回退到UTF-8
             }
           }
-          
-          const lines = text.split(/\r?\n/).filter(line => line.trim());
-          const data: any[] = [];
-          
-          console.log('CSV内容:', lines); // 调试
-          
-          // 尝试自动识别表头
-          let startIndex = 0;
-          if (lines.length > 0) {
-            const firstLine = lines[0];
-            if (firstLine.includes('分镜') || firstLine.includes('序号')) {
-              startIndex = 1; // 有表头，跳过第一行
+
+          // 检测分隔符
+          const firstLine = text.split(/\r?\n/)[0];
+          const delimiter = firstLine.includes('\t') ? '\t' : ',';
+
+          // 解析CSV单元格，处理引号转义
+          function parseCSVField(input: string): string {
+            const result: string[] = [];
+            let current = '';
+            let inQuotes = false;
+            let i = 0;
+
+            while (i < input.length) {
+              const char = input[i];
+              const nextChar = input[i + 1];
+
+              if (inQuotes) {
+                if (char === '"') {
+                  if (nextChar === '"') {
+                    current += '"';
+                    i += 2;
+                  } else {
+                    inQuotes = false;
+                    i++;
+                  }
+                } else {
+                  current += char;
+                  i++;
+                }
+              } else {
+                if (char === '"') {
+                  inQuotes = true;
+                  i++;
+                } else {
+                  current += char;
+                  i++;
+                }
+              }
             }
+            return current.trim();
           }
-          
-          for (let i = startIndex; i < lines.length; i++) {
-            const columns = lines[i].split(',');
-            if (columns.length >= 3) {
-              const sceneNo = parseInt(columns[0].trim());
-              const assets = columns[1].trim().split(/[,，]/).map(a => a.trim()).filter(a => a);
-              const prompt = columns.slice(2).join(',').trim();
-              
-              console.log('解析行:', { sceneNo, assets, prompt }); // 调试
-              
-              if (!isNaN(sceneNo)) {
-                data.push({ sceneNo, assets, prompt });
+
+          // 按行解析CSV，保持引号内换行（引号原封不动保留）
+          const rows: string[] = [];
+          let currentRow = '';
+          let inQuotes = false;
+
+          for (let i = 0; i < text.length; i++) {
+            const char = text[i];
+            const nextChar = text[i + 1];
+
+            if (inQuotes) {
+              currentRow += char;
+              if (char === '"') {
+                if (nextChar !== '"') {
+                  // 单独引号，退出引号（连续引号""是转义）
+                  inQuotes = false;
+                } else {
+                  // 转义引号，跳过第二个
+                  i++;
+                }
+              }
+            } else {
+              if (char === '"') {
+                currentRow += char;
+                inQuotes = true;
+              } else if (char === '\n' || (char === '\r' && text[i + 1] === '\n')) {
+                const line = currentRow.trim();
+                if (line) rows.push(line);
+                currentRow = '';
+                if (char === '\r') i++;
+              } else {
+                currentRow += char;
               }
             }
           }
-          console.log('解析结果:', data); // 调试
+
+          // 处理最后一行
+          const lastLine = currentRow.trim();
+          if (lastLine) rows.push(lastLine);
+
+          console.log('CSV解析后行数:', rows.length);
+
+          const data: any[] = [];
+          let startIndex = 0;
+
+          // 识别表头
+          if (rows.length > 0) {
+            const firstRow = rows[0];
+            if (firstRow.includes('分镜') || firstRow.includes('序号')) {
+              startIndex = 1;
+            }
+          }
+
+          for (let i = startIndex; i < rows.length; i++) {
+            const row = rows[i];
+            const fields: string[] = [];
+            let currentField = '';
+            let inRowQuotes = false;
+
+            // 逐字符解析行
+            for (let j = 0; j < row.length; j++) {
+              const char = row[j];
+              const nextChar = row[j + 1];
+
+              if (inRowQuotes) {
+                if (char === '"') {
+                  if (nextChar === '"') {
+                    currentField += '"';
+                    j++;
+                  } else {
+                    inRowQuotes = false;
+                  }
+                } else {
+                  currentField += char;
+                }
+              } else {
+                if (char === '"') {
+                  inRowQuotes = true;
+                } else if (char === delimiter) {
+                  fields.push(currentField.trim());
+                  currentField = '';
+                } else {
+                  currentField += char;
+                }
+              }
+            }
+
+            fields.push(currentField.trim());
+
+            if (fields.length >= 3) {
+              const sceneNo = parseInt(fields[0].trim());
+              // 如果素材字段被引号包裹，先去掉引号
+              let assetsField = fields[1].trim();
+              if (assetsField.startsWith('"') && assetsField.endsWith('"')) {
+                assetsField = assetsField.slice(1, -1);
+              }
+              const assets = assetsField.split(/[,，]/).map(a => a.trim()).filter(a => a);
+              const prompt = fields.slice(2).join(' ').trim();
+
+              if (!isNaN(sceneNo)) {
+                data.push({ sceneNo, assets, prompt });
+                console.log(`分镜${sceneNo}: 素材${assets.length}个, 提示词${prompt.length}字`);
+              }
+            }
+          }
+
+          console.log('解析结果:', data.length, '个分镜');
           resolve(data);
         } catch (error) {
           reject(error);
         }
       };
       reader.onerror = reject;
-      
+
       if (encoding === 'utf8') {
         reader.readAsText(file, 'utf-8');
       } else {
-        reader.readAsArrayBuffer(file); // GBK用ArrayBuffer读取，在onload中解码
+        reader.readAsArrayBuffer(file);
       }
     });
   }
@@ -615,7 +731,7 @@ function App() {
                   <Upload size={14} />批量导入
                   <input 
                     type="file" 
-                    accept=".csv"
+                    accept=".csv,.tsv,.txt"
                     ref={fileInputRef}
                     onChange={handleFileSelect}
                   />
@@ -643,6 +759,7 @@ function App() {
                   <button className="mini-button" onClick={() => mutate(`/api/projects/${selectedProject.id}/storyboards`)}>增加</button>
                 </div>
               </div>
+              <div className="scene-list-scroll">
               {projectStoryboards.map((storyboard) => {
                 const hasBeenSubmitted = storyboard.status !== 'idle';
                 const isPending = pendingStoryboards.has(storyboard.id);
@@ -670,6 +787,7 @@ function App() {
                   </div>
                 );
               })}
+              </div>
             </section>
 
             <section className="editor panel">
@@ -860,12 +978,13 @@ function App() {
             <div className="import-preview">
               {importData.length === 0 ? (
                 <div className="empty-import">
-                  <p>没有解析到数据，请检查CSV文件格式</p>
+                  <p>没有解析到数据，请检查文件格式</p>
                   <p className="csv-example">
-                    示例格式：<br/>
-                    分镜序号,分镜素材,提示词<br/>
-                    1,@马力,@jinu,一个人在雨中行走<br/>
-                    3,@风景,美丽的自然风光
+                    逗号/Tab分隔均可，支持引号内换行<br/>
+                    CSV示例：<br/>
+                    1,"@素材1,@素材2","提示词第一行<br/>提示词第二行"<br/>
+                    TSV示例：<br/>
+                    1&lt;TAB&gt;@素材1,@素材2&lt;TAB&gt;提示词（可换行）
                   </p>
                 </div>
               ) : (

@@ -145,6 +145,11 @@ button.secondary, .mini-button {
 .main-panel {
   padding: 22px;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+  box-sizing: border-box;
 }
 
 .topbar {
@@ -184,7 +189,9 @@ button.secondary, .mini-button {
   display: grid;
   grid-template-columns: 220px minmax(460px, 1fr) 390px;
   gap: 16px;
-  align-items: start;
+  flex: 1;
+  min-height: 0;
+  align-items: stretch;
 }
 
 .panel {
@@ -211,6 +218,30 @@ button.secondary, .mini-button {
   display: flex;
   gap: 6px;
   margin-left: auto;
+}
+
+.scene-list.panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.scene-list-scroll {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.editor.panel {
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.library-column {
+  display: grid;
+  gap: 16px;
+  overflow-y: auto;
+  min-height: 0;
 }
 
 .scene-row-wrapper {
@@ -406,11 +437,6 @@ input, select {
   gap: 10px;
   margin-top: 14px;
   flex-wrap: wrap;
-}
-
-.library-column {
-  display: grid;
-  gap: 16px;
 }
 
 .file-pick {
