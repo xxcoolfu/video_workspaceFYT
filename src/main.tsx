@@ -94,6 +94,7 @@ function App() {
   const [deleteConfirm, setDeleteConfirm] = React.useState<{ type: 'group' | 'project'; id: string; name: string } | null>(null);
   const [batchEditDialog, setBatchEditDialog] = React.useState(false);
   const [batchEditParams, setBatchEditParams] = React.useState<ProjectDefaults>(DEFAULT_PROJECT_DEFAULTS);
+  const [sidebarCollapsed, setSidebarCollapsed] = React.useState(false);
 
   const refresh = React.useCallback(async () => {
     setIsPolling(true);
@@ -505,13 +506,21 @@ function App() {
 
   return (
     <main className="app-shell">
-      <aside className="sidebar">
+      <aside className={`sidebar ${sidebarCollapsed ? 'collapsed' : ''}`}>
         <div className="brand">
           <Video size={24} />
           <div>
             <strong>AI视频制作</strong>
             <span>即梦 CLI 队列工作台</span>
           </div>
+          <button 
+            className="icon-button" 
+            title={sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'} 
+            onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+            style={{ marginLeft: 'auto' }}
+          >
+            {sidebarCollapsed ? '→' : '←'}
+          </button>
         </div>
 
         <button className="nav-button" onClick={createGroup}><FolderPlus size={16} />新增分组</button>

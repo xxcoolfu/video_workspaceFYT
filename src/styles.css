@@ -50,6 +50,11 @@ button.secondary, .mini-button {
   display: grid;
   grid-template-columns: 280px 1fr;
   min-height: 100vh;
+  transition: grid-template-columns 0.3s ease;
+}
+
+.app-shell:has(.sidebar.collapsed) {
+  grid-template-columns: 60px 1fr;
 }
 
 .sidebar {
@@ -59,6 +64,20 @@ button.secondary, .mini-button {
   display: flex;
   flex-direction: column;
   gap: 14px;
+  overflow: hidden;
+  transition: padding 0.3s ease;
+}
+
+.sidebar.collapsed {
+  padding: 12px;
+}
+
+.sidebar.collapsed .brand div,
+.sidebar.collapsed .nav-button span,
+.sidebar.collapsed .settings-link span,
+.sidebar.collapsed .sidebar-section,
+.sidebar.collapsed .delete-btn {
+  display: none;
 }
 
 .brand {
@@ -66,6 +85,10 @@ button.secondary, .mini-button {
   gap: 12px;
   align-items: center;
   margin-bottom: 8px;
+}
+
+.sidebar.collapsed .brand {
+  justify-content: center;
 }
 
 .brand span {
@@ -79,6 +102,12 @@ button.secondary, .mini-button {
   justify-content: flex-start;
   background: #243835;
   width: 100%;
+}
+
+.sidebar.collapsed .nav-button,
+.sidebar.collapsed .settings-link {
+  justify-content: center;
+  padding: 0;
 }
 
 .sidebar-section {
