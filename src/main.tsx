@@ -88,6 +88,12 @@ function App() {
   const [fileEncoding, setFileEncoding] = React.useState<'utf8' | 'gbk'>('utf8');
   const [currentFile, setCurrentFile] = React.useState<File | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const [groupDialog, setGroupDialog] = React.useState(false);
+  const [newGroupName, setNewGroupName] = React.useState('新分组');
+  const [collapsedGroups, setCollapsedGroups] = React.useState<Set<string>>(new Set());
+  const [deleteConfirm, setDeleteConfirm] = React.useState<{ type: 'group' | 'project'; id: string; name: string } | null>(null);
+  const [batchEditDialog, setBatchEditDialog] = React.useState(false);
+  const [batchEditParams, setBatchEditParams] = React.useState<ProjectDefaults>(DEFAULT_PROJECT_DEFAULTS);
 
   const refresh = React.useCallback(async () => {
     setIsPolling(true);
@@ -123,13 +129,74 @@ function App() {
   }, [projectStoryboards, selectedStoryboardId]);
 
   async function mutate(path: string, body?: unknown, method = 'POST') {
-    const next = await api<AppState>(path, { method, body: JSON.stringify(body || {}) });
+    const init: RequestInit = { method };
+    // 只对非DELETE方法添加body
+    if (method !== 'DELETE' && body !== undefined) {
+      init.body = JSON.stringify(body);
+    }
+    const next = await api<AppState>(path, init);
     setState(next);
     return next;
   }
 
   async function createGroup() {
-    await mutate('/api/groups', { name: `分组 ${state.groups.length + 1}` });
+    setGroupDialog(true);
+  }
+
+  async function confirmCreateGroup() {
+    if (!newGroupName.trim()) return;
+    await mutate('/api/groups', { name: newGroupName });
+    setGroupDialog(false);
+    setNewGroupName('新分组');
+  }
+
+  async function deleteGroup(groupId: string, groupName: string) {
+    setDeleteConfirm({ type: 'group', id: groupId, name: groupName });
+  }
+
+  async function deleteProject(projectId: string, projectName: string) {
+    setDeleteConfirm({ type: 'project', id: projectId, name: projectName });
+  }
+
+  async function confirmDelete() {
+    if (!deleteConfirm) return;
+    
+    console.log('confirmDelete called with:', deleteConfirm);
+    
+    try {
+      if (deleteConfirm.type === 'group') {
+        console.log('Deleting group:', deleteConfirm.id);
+        await mutate(`/api/groups/${deleteConfirm.id}`, undefined, 'DELETE');
+        if (selectedGroupId === deleteConfirm.id) {
+          setSelectedGroupId('');
+          setSelectedProjectId('');
+        }
+      } else {
+        console.log('Deleting project:', deleteConfirm.id);
+        await mutate(`/api/projects/${deleteConfirm.id}`, undefined, 'DELETE');
+        if (selectedProjectId === deleteConfirm.id) {
+          setSelectedProjectId('');
+        }
+      }
+      
+      console.log('Deletion completed, closing dialog');
+      setDeleteConfirm(null);
+    } catch (error) {
+      console.error('Error deleting:', error);
+      alert('删除失败：' + (error instanceof Error ? error.message : '未知错误'));
+    }
+  }
+
+  function toggleGroupCollapse(groupId: string) {
+    setCollapsedGroups(prev => {
+      const next = new Set(prev);
+      if (next.has(groupId)) {
+        next.delete(groupId);
+      } else {
+        next.add(groupId);
+      }
+      return next;
+    });
   }
 
   async function createProject() {
@@ -142,6 +209,28 @@ function App() {
       setSelectedGroupId(project.groupId);
     }
     setProjectDialog(false);
+  }
+
+  // 打开批量修改对话框时初始化参数为项目默认值
+  function openBatchEditDialog() {
+    if (selectedProject) {
+      setBatchEditParams({ ...DEFAULT_PROJECT_DEFAULTS, ...selectedProject.defaults });
+    }
+    setBatchEditDialog(true);
+  }
+
+  async function doBatchEdit() {
+    if (!selectedProject) return;
+    // 只传我们修改的三个参数，不传全部
+    await mutate(`/api/projects/${selectedProject.id}/storyboards-batch`, { 
+      overrides: {
+        aspectRatio: batchEditParams.aspectRatio,
+        resolution: batchEditParams.resolution,
+        modelVersion: batchEditParams.modelVersion
+      }
+    }, 'PUT');
+    setBatchEditDialog(false);
+    setToast(`已批量更新项目内所有分镜的参数`);
   }
 
   async function saveStoryboard(storyboard: Storyboard, patch: Partial<Storyboard>) {
@@ -429,26 +518,57 @@ function App() {
         <button className="nav-button" onClick={() => setProjectDialog(true)} disabled={!state.groups.length}><Plus size={16} />新建项目</button>
 
         <div className="sidebar-section">
-          {state.groups.map((group: Group) => (
-            <section key={group.id} className="group-block">
-              <button className={`group-title ${selectedGroupId === group.id ? 'active' : ''}`} onClick={() => setSelectedGroupId(group.id)}>
-                {group.name}
-              </button>
-              {state.projects.filter((project) => project.groupId === group.id).map((project) => (
-                <button
-                  key={project.id}
-                  className={`project-link ${selectedProjectId === project.id ? 'active' : ''}`}
-                  onClick={() => {
-                    setSelectedProjectId(project.id);
-                    setSelectedGroupId(project.groupId);
-                    setView('workbench');
-                  }}
-                >
-                  {project.name}
-                </button>
-              ))}
-            </section>
-          ))}
+          {state.groups.map((group: Group) => {
+            const isCollapsed = collapsedGroups.has(group.id);
+            const groupProjects = state.projects.filter((project) => project.groupId === group.id);
+            return (
+              <section key={group.id} className="group-block">
+                <div className="group-header">
+                  <button 
+                    className={`group-title ${selectedGroupId === group.id ? 'active' : ''}`} 
+                    onClick={() => setSelectedGroupId(group.id)}
+                    onDoubleClick={() => toggleGroupCollapse(group.id)}
+                  >
+                    {isCollapsed ? '▶' : '▼'} {group.name}
+                  </button>
+                  <button 
+                    className="delete-btn"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      deleteGroup(group.id, group.name);
+                    }}
+                    title="删除分组"
+                  >
+                    ✕
+                  </button>
+                </div>
+                {!isCollapsed && groupProjects.map((project) => (
+                  <div key={project.id} className="project-item">
+                    <button
+                      className={`project-link ${selectedProjectId === project.id ? 'active' : ''}`}
+                      onClick={() => {
+                        setSelectedProjectId(project.id);
+                        setSelectedGroupId(project.groupId);
+                        setView('workbench');
+                      }}
+                    >
+                      {project.name}
+                    </button>
+                    <button 
+                      className="delete-btn"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        deleteProject(project.id, project.name);
+                      }}
+                      title="删除项目"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </section>
+            );
+          })}
         </div>
 
         <button className={`settings-link ${view === 'settings' ? 'active' : ''}`} onClick={() => setView('settings')}>
@@ -458,9 +578,26 @@ function App() {
 
       <section className="main-panel">
         <header className="topbar">
-          <div>
-            <p>{selectedGroup?.name || '尚未选择分组'}</p>
-            <h1>{view === 'settings' ? '设置' : selectedProject?.name || '创建一个项目开始'}</h1>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '16px', flexWrap: 'wrap' }}>
+            <div>
+              <p>{selectedGroup?.name || '尚未选择分组'}</p>
+              <h1>{view === 'settings' ? '设置' : selectedProject?.name || '创建一个项目开始'}</h1>
+            </div>
+            {selectedProject && (
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <label className="mini-button file-pick" style={{ padding: '8px 16px', height: '40px', minHeight: '40px' }}>
+                  <Upload size={14} />批量导入
+                  <input 
+                    type="file" 
+                    accept=".csv"
+                    ref={fileInputRef}
+                    onChange={handleFileSelect}
+                  />
+                </label>
+                <button className="mini-button" onClick={openBatchEditDialog} style={{ padding: '8px 16px', height: '40px', minHeight: '40px' }}>批量修改</button>
+                <button className="mini-button" onClick={() => void enqueuePending()} style={{ padding: '8px 16px', height: '40px', minHeight: '40px' }}>批量提交</button>
+              </div>
+            )}
           </div>
           <div className="topbar-actions">
             {toast && <span className="toast">{toast}</span>}
@@ -477,16 +614,6 @@ function App() {
                 <ListPlus size={17} />
                 <strong>分镜</strong>
                 <div className="panel-title-actions">
-                  <label className="mini-button file-pick">
-                    <Upload size={14} />批量导入
-                    <input 
-                      type="file" 
-                      accept=".csv"
-                      ref={fileInputRef}
-                      onChange={handleFileSelect}
-                    />
-                  </label>
-                  <button className="mini-button" onClick={() => void enqueuePending()}>批量提交</button>
                   <button className="mini-button" onClick={() => mutate(`/api/projects/${selectedProject.id}/storyboards`)}>增加</button>
                 </div>
               </div>
@@ -674,6 +801,22 @@ function App() {
         </div>
       )}
       
+      {groupDialog && (
+        <div className="modal-backdrop">
+          <div className="modal">
+            <h2>新建分组</h2>
+            <label>分组名<input value={newGroupName} onChange={(event) => setNewGroupName(event.target.value)} /></label>
+            <div className="modal-actions">
+              <button className="secondary" onClick={() => {
+                setGroupDialog(false);
+                setNewGroupName('新分组');
+              }}>取消</button>
+              <button onClick={confirmCreateGroup}><Check size={16} />创建</button>
+            </div>
+          </div>
+        </div>
+      )}
+      
       {importDialog && (
         <div className="modal-backdrop">
           <div className="modal modal-large">
@@ -753,6 +896,155 @@ function App() {
               <button onClick={async () => {
                 await executeImport();
               }}><Check size={16} />导入</button>
+            </div>
+          </div>
+        </div>
+      )}
+      
+      {batchEditDialog && (
+        <div 
+          className="modal-backdrop delete-confirm-backdrop"
+          style={{ 
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: 'rgba(8, 18, 17, 0.42)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 99999,
+            padding: '20px'
+          }}
+        >
+          <div 
+            className="modal delete-confirm-modal"
+            style={{ 
+              background: '#fbfdfc',
+              borderRadius: '8px',
+              padding: '30px',
+              boxShadow: '0 24px 60px rgba(0,0,0,0.22)',
+              width: '100%',
+              maxWidth: '500px',
+              position: 'relative',
+              zIndex: 100000,
+              overflow: 'visible'
+            }}
+          >
+            <h2 style={{ marginTop: 0, marginBottom: '20px' }}>批量修改分镜参数</h2>
+            
+            <div className="defaults-grid">
+              <label>画幅
+                <select value={batchEditParams.aspectRatio} onChange={(event) => setBatchEditParams({ ...batchEditParams, aspectRatio: event.target.value as ProjectDefaults['aspectRatio'] })}>
+                  {['16:9', '9:16', '1:1', '4:3', '3:4'].map((item) => <option key={item}>{item}</option>)}
+                </select>
+              </label>
+              <label>分辨率
+                <select value={batchEditParams.resolution} onChange={(event) => setBatchEditParams({ ...batchEditParams, resolution: event.target.value as ProjectDefaults['resolution'] })}>
+                  {['480p', '720p', '1080p'].map((item) => <option key={item}>{item}</option>)}
+                </select>
+              </label>
+              <label>模型
+                <select value={batchEditParams.modelVersion} onChange={(event) => setBatchEditParams({ ...batchEditParams, modelVersion: event.target.value as ProjectDefaults['modelVersion'] })}>
+                  {MODEL_VERSIONS.map((item) => <option key={item} value={item}>{modelLabel(item)}{item.includes('vip') ? ' · 高消耗' : ''}</option>)}
+                </select>
+              </label>
+            </div>
+            
+            <div style={{ display: 'flex', gap: '10px', marginTop: '20px', paddingBottom: '10px' }}>
+              <button 
+                onClick={() => setBatchEditDialog(false)}
+                style={{ 
+                  background: '#e8eeed', 
+                  color: '#23413e', 
+                  minHeight: '40px', 
+                  padding: '10px 20px', 
+                  border: 'none', 
+                  borderRadius: '7px',
+                  cursor: 'pointer',
+                  flex: 1
+                }}
+              >取消</button>
+              <button 
+                onClick={doBatchEdit}
+                style={{ 
+                  background: '#186a63', 
+                  color: 'white', 
+                  minHeight: '40px', 
+                  padding: '10px 20px', 
+                  border: 'none', 
+                  borderRadius: '7px',
+                  cursor: 'pointer',
+                  flex: 1
+                }}
+              >确认修改</button>
+            </div>
+          </div>
+        </div>
+      )}
+      
+      {deleteConfirm && (
+        <div 
+          className="modal-backdrop delete-confirm-backdrop"
+          style={{ 
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: 'rgba(8, 18, 17, .42)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 99999,
+            padding: '20px'
+          }}
+        >
+          <div 
+            className="modal delete-confirm-modal"
+            style={{ 
+              background: '#fbfdfc',
+              borderRadius: '8px',
+              padding: '30px',
+              boxShadow: '0 24px 60px rgba(0,0,0,.22)',
+              width: '100%',
+              maxWidth: '500px',
+              position: 'relative',
+              zIndex: 100000,
+              overflow: 'visible'
+            }}
+          >
+            <h2 style={{ marginTop: 0, marginBottom: '15px' }}>确认删除</h2>
+            <p style={{ marginBottom: '10px' }}>确定要删除 {deleteConfirm.type === 'group' ? '分组' : '项目'}「{deleteConfirm.name}」吗？</p>
+            <p style={{ color: '#dc3545', marginBottom: '25px' }}>此操作不可撤销，所有数据将永久删除。</p>
+            <div style={{ display: 'flex', gap: '10px' }}>
+              <button 
+                onClick={() => setDeleteConfirm(null)}
+                style={{ 
+                  background: '#e8eeed', 
+                  color: '#23413e', 
+                  minHeight: '40px', 
+                  padding: '10px 20px', 
+                  border: 'none', 
+                  borderRadius: '7px',
+                  cursor: 'pointer',
+                  flex: 1
+                }}
+              >取消</button>
+              <button 
+                onClick={confirmDelete}
+                style={{ 
+                  background: '#dc3545', 
+                  color: 'white', 
+                  minHeight: '40px', 
+                  padding: '10px 20px', 
+                  border: 'none', 
+                  borderRadius: '7px',
+                  cursor: 'pointer',
+                  flex: 1
+                }}
+              >确认删除</button>
             </div>
           </div>
         </div>

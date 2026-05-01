@@ -451,6 +451,7 @@ input, select {
   display: grid;
   place-items: center;
   padding: 20px;
+  z-index: 9999;
 }
 
 .modal {
@@ -459,7 +460,106 @@ input, select {
   border-radius: 8px;
   padding: 20px;
   box-shadow: 0 24px 60px rgba(0,0,0,.22);
+  z-index: 10000;
+  position: relative;
 }
+
+.modal button {
+  pointer-events: auto;
+  position: relative;
+  z-index: 10001;
+}
+
+/* 删除确认对话框更高的层级 */
+.modal-backdrop:has(+ .modal-backdrop:last-child) {
+  z-index: 9998;
+}
+
+.modal-backdrop:last-child {
+  z-index: 10002;
+}
+
+.modal-backdrop:last-child .modal {
+  z-index: 10003;
+}
+
+.modal-backdrop:last-child .modal button {
+  z-index: 10004;
+}
+
+/* 专门给删除确认框的极高层级 */
+.delete-confirm-backdrop {
+  z-index: 99999 !important;
+}
+
+.delete-confirm-modal {
+  z-index: 100000 !important;
+}
+
+.delete-confirm-modal button {
+  z-index: 100001 !important;
+  pointer-events: auto !important;
+}
+
+.delete-confirm-modal {
+  overflow: visible !important;
+  max-height: none !important;
+}
+
+.delete-confirm-modal .modal-actions {
+  margin-top: 20px;
+  padding-bottom: 10px;
+}
+
+.delete-confirm-modal .modal-actions button {
+  min-height: 40px !important;
+  padding: 8px 20px !important;
+  pointer-events: auto !important;
+}
+
+/* 强制让删除确认框完全可见 */
+.delete-confirm-backdrop {
+  overflow: visible !important;
+}
+
+.delete-confirm-modal {
+  position: relative !important;
+  display: block !important;
+  overflow: visible !important;
+  height: auto !important;
+  max-height: none !important;
+}
+
+.delete-confirm-modal * {
+  position: relative !important;
+}
+
+/* 增加更多的内边距确保内容完整可见 */
+.delete-confirm-modal {
+  padding: 30px !important;
+}
+
+.delete-confirm-modal .modal-actions {
+  padding-top: 20px !important;
+  padding-bottom: 10px !important;
+}
+
+.delete-confirm-modal .modal-actions button {
+  min-width: 100px !important;
+  opacity: 1 !important;
+  border: 2px solid transparent !important;
+}
+
+.delete-confirm-modal .modal-actions button:hover {
+  filter: brightness(1.1);
+}
+
+
+
+
+
+
+
 
 .modal h2 {
   margin-top: 0;
@@ -599,6 +699,66 @@ input, select {
   font-size: 13px;
   line-height: 1.8;
 }
+
+.group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.group-title {
+  flex: 1;
+  text-align: left;
+  padding: 10px 12px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  border-radius: 8px;
+}
+
+.group-title:hover {
+  background: var(--color-surface-hover);
+}
+
+.group-title.active {
+  color: var(--color-accent);
+  background: var(--color-surface-hover);
+}
+
+.project-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.project-link {
+  flex: 1;
+}
+
+.delete-btn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  border: none;
+  background: transparent;
+  color: #999;
+  cursor: pointer;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.delete-btn:hover {
+  background: #fee2e2;
+  color: var(--color-danger);
+}
+
 
 .encoding-select {
   display: flex;

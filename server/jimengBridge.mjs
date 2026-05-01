@@ -499,8 +499,39 @@ function configureRoutes(app) {
     response.setHeader('Access-Control-Allow-Origin', '*');
     response.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
     response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    console.log(`${request.method} ${request.path}`);
     if (request.method === 'OPTIONS') return response.status(204).end();
     return next();
+  });
+
+  // Delete routes - added first to ensure they are registered
+  app.delete('/api/groups/:id', (request, response) => {
+    console.log('DELETE /api/groups/:id', request.params.id);
+    const database = initDb();
+    // 删除分组下的所有项目的相关数据
+    const projects = database.prepare('select * from projects where group_id = ?').all(request.params.id);
+    for (const project of projects) {
+      database.prepare('delete from output_assets where project_id = ?').run(project.id);
+      database.prepare('delete from input_assets where project_id = ?').run(project.id);
+      database.prepare('delete from storyboards where project_id = ?').run(project.id);
+      database.prepare('delete from queue_tasks where project_id = ?').run(project.id);
+      database.prepare('delete from projects where id = ?').run(project.id);
+    }
+    // 删除分组
+    database.prepare('delete from groups where id = ?').run(request.params.id);
+    response.json(getState());
+  });
+
+  app.delete('/api/projects/:id', (request, response) => {
+    console.log('DELETE /api/projects/:id', request.params.id);
+    const database = initDb();
+    // 删除项目相关数据
+    database.prepare('delete from output_assets where project_id = ?').run(request.params.id);
+    database.prepare('delete from input_assets where project_id = ?').run(request.params.id);
+    database.prepare('delete from storyboards where project_id = ?').run(request.params.id);
+    database.prepare('delete from queue_tasks where project_id = ?').run(request.params.id);
+    database.prepare('delete from projects where id = ?').run(request.params.id);
+    response.json(getState());
   });
 
   app.get('/api/state', (_request, response) => response.json(getState()));
@@ -565,6 +596,31 @@ function configureRoutes(app) {
     const assetIds = Array.isArray(request.body?.assetIds) ? request.body.assetIds.map(String) : [];
     initDb().prepare('update storyboards set prompt = ?, overrides_json = ?, asset_ids_json = ?, updated_at = ? where id = ?')
       .run(prompt, JSON.stringify(overrides), JSON.stringify(assetIds), nowIso(), request.params.id);
+    response.json(getState());
+  });
+
+  // 批量更新项目内所有分镜的参数
+  app.put('/api/projects/:id/storyboards-batch', (request, response) => {
+    const database = initDb();
+    const projectId = request.params.id;
+    
+    // 获取要更新的参数
+    const overrides = request.body?.overrides && typeof request.body.overrides === 'object' ? request.body.overrides : {};
+    
+    // 获取该项目的所有分镜
+    const storyboards = database.prepare('select * from storyboards where project_id = ?').all(projectId);
+    
+    // 逐个更新分镜
+    const updatedAt = nowIso();
+    for (const storyboard of storyboards) {
+      // 合并现有的 overrides
+      const existingOverrides = parseJson(storyboard.overrides_json, {});
+      const newOverrides = { ...existingOverrides, ...overrides };
+      
+      database.prepare('update storyboards set overrides_json = ?, updated_at = ? where id = ?')
+        .run(JSON.stringify(newOverrides), updatedAt, storyboard.id);
+    }
+    
     response.json(getState());
   });
 
