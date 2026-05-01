@@ -82,6 +82,12 @@ function App() {
   const [savedStoryboardId, setSavedStoryboardId] = React.useState('');
   const [isPolling, setIsPolling] = React.useState(false);
   const [pendingStoryboards, setPendingStoryboards] = React.useState<Set<string>>(new Set());
+  const [importDialog, setImportDialog] = React.useState(false);
+  const [importData, setImportData] = React.useState<any[]>([]);
+  const [overwriteScenes, setOverwriteScenes] = React.useState<Set<number>>(new Set());
+  const [fileEncoding, setFileEncoding] = React.useState<'utf8' | 'gbk'>('utf8');
+  const [currentFile, setCurrentFile] = React.useState<File | null>(null);
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
 
   const refresh = React.useCallback(async () => {
     setIsPolling(true);
@@ -192,6 +198,197 @@ function App() {
     });
   }
 
+  // 解析CSV文件
+  function parseCSV(file: File, encoding: 'utf8' | 'gbk'): Promise<any[]> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        try {
+          let text = e.target?.result as string;
+          
+          // 如果选择GBK编码，需要用TextDecoder解码
+          if (encoding === 'gbk' && file.arrayBuffer) {
+            const buffer = await file.arrayBuffer();
+            try {
+              const decoder = new TextDecoder('gbk');
+              text = decoder.decode(buffer);
+            } catch (err) {
+              console.log('GBK解码失败，尝试UTF-8', err);
+              // 回退到UTF-8
+            }
+          }
+          
+          const lines = text.split(/\r?\n/).filter(line => line.trim());
+          const data: any[] = [];
+          
+          console.log('CSV内容:', lines); // 调试
+          
+          // 尝试自动识别表头
+          let startIndex = 0;
+          if (lines.length > 0) {
+            const firstLine = lines[0];
+            if (firstLine.includes('分镜') || firstLine.includes('序号')) {
+              startIndex = 1; // 有表头，跳过第一行
+            }
+          }
+          
+          for (let i = startIndex; i < lines.length; i++) {
+            const columns = lines[i].split(',');
+            if (columns.length >= 3) {
+              const sceneNo = parseInt(columns[0].trim());
+              const assets = columns[1].trim().split(/[,，]/).map(a => a.trim()).filter(a => a);
+              const prompt = columns.slice(2).join(',').trim();
+              
+              console.log('解析行:', { sceneNo, assets, prompt }); // 调试
+              
+              if (!isNaN(sceneNo)) {
+                data.push({ sceneNo, assets, prompt });
+              }
+            }
+          }
+          console.log('解析结果:', data); // 调试
+          resolve(data);
+        } catch (error) {
+          reject(error);
+        }
+      };
+      reader.onerror = reject;
+      
+      if (encoding === 'utf8') {
+        reader.readAsText(file, 'utf-8');
+      } else {
+        reader.readAsArrayBuffer(file); // GBK用ArrayBuffer读取，在onload中解码
+      }
+    });
+  }
+
+  // 处理文件选择
+  async function handleFileSelect(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    
+    setCurrentFile(file);
+    
+    try {
+      const data = await parseCSV(file, fileEncoding);
+      setImportData(data);
+      
+      // 检测冲突
+      const conflicts = new Set<number>();
+      data.forEach(item => {
+        const existing = projectStoryboards.find(s => s.sceneNo === item.sceneNo);
+        if (existing && existing.prompt.trim()) {
+          conflicts.add(item.sceneNo);
+        }
+      });
+      setOverwriteScenes(conflicts);
+      
+      setImportDialog(true);
+    } catch (error) {
+      setToast('文件解析失败，请检查格式');
+    }
+    
+    // 重置input
+    if (event.target) {
+      event.target.value = '';
+    }
+  }
+
+  // 重新解析文件
+  async function reparseFile() {
+    if (!currentFile) return;
+    
+    try {
+      const data = await parseCSV(currentFile, fileEncoding);
+      setImportData(data);
+      
+      // 检测冲突
+      const conflicts = new Set<number>();
+      data.forEach(item => {
+        const existing = projectStoryboards.find(s => s.sceneNo === item.sceneNo);
+        if (existing && existing.prompt.trim()) {
+          conflicts.add(item.sceneNo);
+        }
+      });
+      setOverwriteScenes(conflicts);
+    } catch (error) {
+      setToast('文件解析失败，请检查格式');
+    }
+  }
+
+  // 执行导入
+  async function executeImport() {
+    if (!selectedProject || importData.length === 0) return;
+    
+    const maxSceneNo = Math.max(...projectStoryboards.map(s => s.sceneNo), 0);
+    const importMaxSceneNo = Math.max(...importData.map(d => d.sceneNo));
+    
+    // 新增缺失的分镜
+    for (let i = maxSceneNo + 1; i <= importMaxSceneNo; i++) {
+      const hasImport = importData.some(d => d.sceneNo === i);
+      if (!hasImport) continue;
+      
+      await mutate(`/api/projects/${selectedProject.id}/storyboards`);
+      await refresh(); // 刷新获取新分镜
+    }
+    
+    // 等待refresh完成
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    const updatedState = await api<AppState>('/api/state');
+    const updatedStoryboards = updatedState.storyboards.filter(s => s.projectId === selectedProjectId);
+    
+    // 处理每个分镜
+    for (const item of importData) {
+      const storyboard = updatedStoryboards.find(s => s.sceneNo === item.sceneNo);
+      if (!storyboard) continue;
+      
+      const shouldOverwrite = overwriteScenes.has(item.sceneNo);
+      const hasExistingPrompt = storyboard.prompt.trim();
+      
+      // 如果已存在且不覆盖，跳过
+      if (hasExistingPrompt && !shouldOverwrite) continue;
+      
+      // 查找素材
+      const assetIds: string[] = [];
+      item.assets.forEach((assetName: string) => {
+        const cleanName = assetName.replace(/^@/, '');
+        const asset = projectAssets.find(a => 
+          a.name === cleanName || 
+          a.filename === cleanName ||
+          a.filename === `${cleanName}.png` ||
+          a.filename === `${cleanName}.jpg` ||
+          a.filename === `${cleanName}.jpeg` ||
+          a.filename === `${cleanName}.webp` ||
+          a.filename === `${cleanName}.mp4`
+        );
+        if (asset) {
+          assetIds.push(asset.id);
+        }
+      });
+      
+      // 组合提示词
+      let promptText = '';
+      if (item.assets.length > 0) {
+        const assetNames = item.assets.map((a: string) => `@${a.replace(/^@/, '')}`).join(' ');
+        promptText = `${assetNames}\n\n${item.prompt}`;
+      } else {
+        promptText = item.prompt;
+      }
+      
+      // 更新分镜
+      await mutate(`/api/storyboards/${storyboard.id}`, {
+        prompt: promptText,
+        overrides: storyboard.overrides,
+        assetIds: assetIds
+      }, 'PUT');
+    }
+    
+    setImportDialog(false);
+    setToast('导入成功！');
+    await refresh();
+  }
+
   async function queueAction(task: QueueTask, action: 'retry' | 'delete' | 'cancel-local') {
     try {
       if (action === 'retry') {
@@ -280,6 +477,15 @@ function App() {
                 <ListPlus size={17} />
                 <strong>分镜</strong>
                 <div className="panel-title-actions">
+                  <label className="mini-button file-pick">
+                    <Upload size={14} />批量导入
+                    <input 
+                      type="file" 
+                      accept=".csv"
+                      ref={fileInputRef}
+                      onChange={handleFileSelect}
+                    />
+                  </label>
                   <button className="mini-button" onClick={() => void enqueuePending()}>批量提交</button>
                   <button className="mini-button" onClick={() => mutate(`/api/projects/${selectedProject.id}/storyboards`)}>增加</button>
                 </div>
@@ -463,6 +669,90 @@ function App() {
             <div className="modal-actions">
               <button className="secondary" onClick={() => setProjectDialog(false)}>取消</button>
               <button onClick={createProject}><Check size={16} />创建</button>
+            </div>
+          </div>
+        </div>
+      )}
+      
+      {importDialog && (
+        <div className="modal-backdrop">
+          <div className="modal modal-large">
+            <h2>导入分镜</h2>
+            <div className="encoding-select">
+              <label>
+                文件编码：
+                <select value={fileEncoding} onChange={(e) => setFileEncoding(e.target.value as any)}>
+                  <option value="utf8">UTF-8</option>
+                  <option value="gbk">GBK (Windows中文)</option>
+                </select>
+              </label>
+              <button className="mini-button" onClick={() => reparseFile()}>重新解析</button>
+            </div>
+            <div className="import-preview">
+              {importData.length === 0 ? (
+                <div className="empty-import">
+                  <p>没有解析到数据，请检查CSV文件格式</p>
+                  <p className="csv-example">
+                    示例格式：<br/>
+                    分镜序号,分镜素材,提示词<br/>
+                    1,@马力,@jinu,一个人在雨中行走<br/>
+                    3,@风景,美丽的自然风光
+                  </p>
+                </div>
+              ) : (
+                <table>
+                  <thead>
+                    <tr>
+                      <th>分镜序号</th>
+                      <th>分镜素材</th>
+                      <th>提示词</th>
+                      <th>覆盖</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {importData.map((item, index) => {
+                      const existing = projectStoryboards.find(s => s.sceneNo === item.sceneNo);
+                      const hasConflict = existing && existing.prompt.trim();
+                      const isChecked = overwriteScenes.has(item.sceneNo);
+                      return (
+                        <tr key={index} className={hasConflict ? 'conflict' : ''}>
+                          <td>{item.sceneNo}</td>
+                          <td>{item.assets.join(', ')}</td>
+                          <td className="prompt-preview">{item.prompt}</td>
+                          <td>
+                            {hasConflict ? (
+                              <input 
+                                type="checkbox" 
+                                checked={isChecked}
+                                onChange={() => {
+                                  setOverwriteScenes(prev => {
+                                    const next = new Set(prev);
+                                    if (next.has(item.sceneNo)) {
+                                      next.delete(item.sceneNo);
+                                    } else {
+                                      next.add(item.sceneNo);
+                                    }
+                                    return next;
+                                  });
+                                }}
+                              />
+                            ) : '-'}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </div>
+            <div className="import-hint">
+              <span className="conflict-hint">黄色</span> 表示该分镜已有提示词，需要勾选"覆盖"才会替换
+            </div>
+            <div className="modal-actions">
+              <button className="secondary" onClick={() => setImportDialog(false)}>取消</button>
+              <button onClick={async () => {
+                await executeImport();
+              }}><Check size={16} />导入</button>
             </div>
           </div>
         </div>
