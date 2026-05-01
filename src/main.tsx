@@ -523,10 +523,15 @@ function App() {
           </button>
         </div>
 
-        <button className="nav-button" onClick={createGroup}><FolderPlus size={16} />新增分组</button>
-        <button className="nav-button" onClick={() => setProjectDialog(true)} disabled={!state.groups.length}><Plus size={16} />新建项目</button>
+        {view !== 'settings' && (
+          <>
+            <button className="nav-button" onClick={createGroup}><FolderPlus size={16} />新增分组</button>
+            <button className="nav-button" onClick={() => setProjectDialog(true)} disabled={!state.groups.length}><Plus size={16} />新建项目</button>
+          </>
+        )}
 
-        <div className="sidebar-section">
+        {view !== 'settings' && (
+          <div className="sidebar-section">
           {state.groups.map((group: Group) => {
             const isCollapsed = collapsedGroups.has(group.id);
             const groupProjects = state.projects.filter((project) => project.groupId === group.id);
@@ -578,7 +583,8 @@ function App() {
               </section>
             );
           })}
-        </div>
+          </div>
+        )}
 
         <button className={`settings-link ${view === 'settings' ? 'active' : ''}`} onClick={() => setView('settings')}>
           <Settings size={16} />设置
@@ -592,7 +598,7 @@ function App() {
               <p>{selectedGroup?.name || '尚未选择分组'}</p>
               <h1>{view === 'settings' ? '设置' : selectedProject?.name || '创建一个项目开始'}</h1>
             </div>
-            {selectedProject && (
+            {selectedProject && view !== 'settings' && (
               <div style={{ display: 'flex', gap: '8px' }}>
                 <label className="mini-button file-pick" style={{ padding: '8px 16px', height: '40px', minHeight: '40px' }}>
                   <Upload size={14} />批量导入
