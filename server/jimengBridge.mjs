@@ -5,12 +5,14 @@ import { createRequire } from 'node:module';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, unlinkSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+
+const isStandalone = typeof process !== 'undefined' && process.argv && process.argv[1] && (fileURLToPath(import.meta.url) === resolve(process.argv[1]) || process.argv[1].endsWith('jimengBridge.mjs'));
 
 // 设置模块查找路径，以便能找到 node_modules
 const modulePaths = [];
@@ -33,7 +35,7 @@ import { pathToFileURL } from 'node:url';
 function setupCustomModulePaths(customNodeModulesPath) {
   if (!customNodeModulesPath) return;
   
-  const paths = customNodeModulesPath.split(/[;:]/).filter(Boolean);
+  const paths = customNodeModulesPath.split(';').filter(Boolean);
   console.log('设置自定义模块路径:', paths);
   
   for (const p of paths) {
@@ -62,6 +64,7 @@ const defaultSettings = {
   materialRoot: join(appRoot, 'materials'),
   outputRoot: join(appRoot, 'outputs'),
   cliBin: process.env.SEEDANCE_CLI_BIN || 'dreamina',
+  submitMode: 'cli',
 };
 const defaultProjectDefaults = {
   aspectRatio: '16:9',
@@ -203,11 +206,13 @@ function initDb() {
     create table if not exists settings (key text primary key, value text not null);
     create table if not exists groups (id text primary key, name text not null, slug text not null, created_at text not null);
     create table if not exists projects (id text primary key, group_id text not null, name text not null, slug text not null, defaults_json text not null, created_at text not null);
-    create table if not exists storyboards (id text primary key, project_id text not null, scene_no integer not null, prompt text not null, overrides_json text not null, asset_ids_json text not null, status text not null, created_at text not null, updated_at text not null);
+    create table if not exists storyboards (id text primary key, project_id text not null, scene_no integer not null, prompt text not null, overrides_json text not null, asset_ids_json text not null, status text not null, created_at text not null, updated_at text not null, is_continuation integer default 0, wait_first_frame_status text);
     create table if not exists input_assets (id text primary key, project_id text not null, kind text not null, name text not null, filename text not null, relative_path text not null, created_at text not null);
     create table if not exists output_assets (id text primary key, project_id text not null, storyboard_id text not null, scene_no integer not null, kind text not null, filename text not null, relative_path text not null, created_at text not null);
     create table if not exists queue_tasks (id text primary key, project_id text not null, storyboard_id text not null, scene_no integer not null, status text not null, submit_id text not null, error text not null, prompt text not null, options_json text not null, created_at text not null, started_at text not null, finished_at text not null, last_checked_at text not null, next_retry_at text not null, attempt_count integer not null, raw_json text not null);
   `);
+  try { db.exec('alter table storyboards add column is_continuation integer default 0'); } catch {}
+  try { db.exec('alter table storyboards add column wait_first_frame_status text'); } catch {}
   if (!getSetting('materialRoot')) setSetting('materialRoot', defaultSettings.materialRoot);
   if (!getSetting('outputRoot')) setSetting('outputRoot', defaultSettings.outputRoot);
   if (!getSetting('cliBin')) setSetting('cliBin', defaultSettings.cliBin);
@@ -227,6 +232,7 @@ function getSettings() {
     materialRoot: getSetting('materialRoot') || defaultSettings.materialRoot,
     outputRoot: getSetting('outputRoot') || defaultSettings.outputRoot,
     cliBin: getSetting('cliBin') || defaultSettings.cliBin,
+    submitMode: getSetting('submitMode') || defaultSettings.submitMode,
   };
 }
 
@@ -256,7 +262,7 @@ function rowProject(row) {
 }
 
 function rowStoryboard(row) {
-  return { id: row.id, projectId: row.project_id, sceneNo: row.scene_no, prompt: row.prompt, overrides: parseJson(row.overrides_json, {}), assetIds: parseJson(row.asset_ids_json, []), status: row.status, createdAt: row.created_at, updatedAt: row.updated_at };
+  return { id: row.id, projectId: row.project_id, sceneNo: row.scene_no, prompt: row.prompt, overrides: parseJson(row.overrides_json, {}), assetIds: parseJson(row.asset_ids_json, []), status: row.status, isContinuation: !!row.is_continuation, createdAt: row.created_at, updatedAt: row.updated_at };
 }
 
 function assetPreviewUrl(asset) {
@@ -293,6 +299,7 @@ function rowQueueTask(row) {
     nextRetryAt: row.next_retry_at,
     attemptCount: row.attempt_count,
     raw: parseJson(row.raw_json, {}),
+    raw_json: row.raw_json || '{}',
   };
 }
 
@@ -332,13 +339,20 @@ function parseCommandJson(stdout, stderr) {
 
 async function runDreaminaJson(args) {
   const { cliBin } = getSettings();
+  const isSubmit = args[0] === 'multimodal2video' || args[0] === 'text2video';
+  const timeoutMs = isSubmit ? 3 * 60 * 1000 : 2 * 60 * 1000;
   try {
     const { stdout, stderr } = await execFileAsync(cliBin, args, {
       cwd: transientRoot,
       maxBuffer: 30 * 1024 * 1024,
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
     });
     return { payload: parseCommandJson(stdout, stderr), stdout, stderr, exitCode: 0 };
   } catch (error) {
+    if (error.killed) {
+      throw new Error(`CLI command timed out after ${Math.round(timeoutMs/1000)}s`);
+    }
     const stdout = error.stdout || '';
     const stderr = error.stderr || '';
     try {
@@ -366,10 +380,11 @@ function buildDreaminaArgs({ prompt, images, videos, audios, options }) {
 }
 
 function compilePromptReferences(prompt, assets) {
+  const safePrompt = String(prompt || '');
   const hits = [];
   for (const asset of assets) {
     for (const needle of [`@${asset.name}`, `@${asset.id}`]) {
-      const index = prompt.indexOf(needle);
+      const index = safePrompt.indexOf(needle);
       if (index >= 0) {
         hits.push({ index, asset });
         break;
@@ -378,7 +393,7 @@ function compilePromptReferences(prompt, assets) {
   }
   const counters = { image: 0, video: 0, audio: 0 };
   const uploadOrder = { image: [], video: [], audio: [] };
-  let compiledPrompt = prompt;
+  let compiledPrompt = safePrompt;
   for (const { asset } of hits.sort((left, right) => left.index - right.index)) {
     if (uploadOrder[asset.kind].includes(asset.id)) continue;
     counters[asset.kind] += 1;
@@ -400,24 +415,50 @@ function taskAssetsForStoryboard(storyboard) {
   return initDb().prepare(`select * from input_assets where id in (${placeholders})`).all(...ids);
 }
 
+async function extractLastFrame(videoPath, outputDir, storyboardId) {
+  if (!existsSync(outputDir)) {
+    mkdirSync(outputDir, { recursive: true });
+  }
+  
+  const framePath = join(outputDir, `${storyboardId}-last-frame.png`);
+  
+  try {
+    const exec = promisify(execFile);
+    await exec('ffmpeg', [
+      '-sseof', '-1',
+      '-i', videoPath,
+      '-vframes', '1',
+      '-q:v', '2',
+      '-y',
+      framePath
+    ], { timeout: 30000 });
+    
+    if (existsSync(framePath)) return framePath;
+  } catch (error) {
+    console.error('[FFMPEG] 提取帧错误:', error?.message || error);
+  }
+  
+  return null;
+}
+
 function buildSubmitInput(task) {
   const storyboard = initDb().prepare('select * from storyboards where id = ?').get(task.storyboard_id);
   if (!storyboard) throw new Error('Storyboard not found.');
   const assets = taskAssetsForStoryboard(storyboard);
-  const promptData = compilePromptReferences(storyboard.prompt || task.prompt, assets);
   const assetById = new Map(assets.map((asset) => [asset.id, asset]));
-  const refs = (kind) => promptData.uploadOrder[kind]
-    .map((id) => assetById.get(id))
-    .filter(Boolean)
-    .map((asset) => ({ id: asset.id, kind: asset.kind, name: asset.name, absolutePath: getAssetAbsolute(asset) }));
+  const assetIds = parseJson(storyboard.asset_ids_json, []);
+  const orderedAssets = assetIds.map((id) => assetById.get(id)).filter(Boolean);
   return {
     projectId: task.project_id,
     storyboardId: task.storyboard_id,
-    prompt: promptData.prompt,
-    images: refs('image'),
-    videos: refs('video'),
-    audios: refs('audio'),
+    prompt: storyboard.prompt || task.prompt || '',
+    images: orderedAssets.filter((a) => a.kind === 'image').map((asset) => ({ id: asset.id, kind: asset.kind, name: asset.name, absolutePath: getAssetAbsolute(asset) })),
+    videos: orderedAssets.filter((a) => a.kind === 'video').map((asset) => ({ id: asset.id, kind: asset.kind, name: asset.name, absolutePath: getAssetAbsolute(asset) })),
+    audios: orderedAssets.filter((a) => a.kind === 'audio').map((asset) => ({ id: asset.id, kind: asset.kind, name: asset.name, absolutePath: getAssetAbsolute(asset) })),
     options: parseJson(task.options_json, defaultProjectDefaults),
+    isContinuation: !!storyboard.is_continuation,
+    sceneNo: storyboard.scene_no,
+    projectIdForFrame: storyboard.project_id,
   };
 }
 
@@ -486,6 +527,9 @@ async function downloadResultFiles(task, payload) {
 }
 
 async function submitQueueTask(task) {
+  console.log('===== [SUBMIT] 开始提交任务 =====');
+  console.log(`[SUBMIT] taskId=${task.id}, sceneNo=${task.scene_no}, storyboardId=${task.storyboard_id}`);
+  
   const database = initDb();
   const startedAt = nowIso();
   database.prepare('update queue_tasks set status = ?, started_at = ?, last_checked_at = ?, error = ? where id = ?')
@@ -493,15 +537,129 @@ async function submitQueueTask(task) {
   updateStoryboardStatus(task.storyboard_id, 'submitting');
 
   const input = buildSubmitInput(task);
-  const args = buildDreaminaArgs(input);
+  console.log(`[SUBMIT] buildSubmitInput完成: isContinuation=${input.isContinuation}, sceneNo=${input.sceneNo}`);
+  console.log(`[SUBMIT] 原始prompt前100字: ${input.prompt.substring(0, 100)}`);
+  console.log(`[SUBMIT] 原始素材: images=${input.images.map(i=>i.name).join(',')}, videos=${input.videos.map(v=>v.name).join(',')}, audios=${input.audios.map(a=>a.name).join(',')}`);
+  
+  if (input.isContinuation) {
+    const prevSceneNo = input.sceneNo - 1;
+    console.log(`[SUBMIT] 连续分镜: 查找上一分镜 sceneNo=${prevSceneNo}`);
+    const prevStoryboard = database.prepare(
+      'select * from storyboards where project_id = ? and scene_no = ?'
+    ).get(input.projectIdForFrame, prevSceneNo);
+    
+    if (prevStoryboard) {
+      console.log(`[SUBMIT] 找到上一分镜: id=${prevStoryboard.id}, status=${prevStoryboard.status}`);
+    } else {
+      console.log(`[SUBMIT] 未找到上一分镜 sceneNo=${prevSceneNo}`);
+    }
+    
+    if (prevStoryboard && prevStoryboard.status === 'succeeded') {
+      const outputAssets = database.prepare(
+        'select * from output_assets where storyboard_id = ? and kind = \'video\''
+      ).all(prevStoryboard.id);
+      
+      console.log(`[SUBMIT] 上一分镜视频输出数量: ${outputAssets.length}`);
+      
+      if (outputAssets.length > 0) {
+        const videoAsset = outputAssets[0];
+        const videoPath = safeResolve(getSettings().outputRoot, videoAsset.relative_path);
+        console.log(`[SUBMIT] 视频路径: ${videoPath}, 存在=${existsSync(videoPath)}`);
+        
+        if (existsSync(videoPath)) {
+          const outputDir = join(tmpdir(), 'dreamina-frames');
+          console.log(`[SUBMIT] 开始提取最后一帧, outputDir=${outputDir}`);
+          const framePath = await extractLastFrame(videoPath, outputDir, prevStoryboard.id);
+          console.log(`[SUBMIT] 提取帧结果: framePath=${framePath}`);
+          
+          if (framePath) {
+            const firstFrameName = `首帧_${prevStoryboard.scene_no}→${input.sceneNo}`;
+            input.images.unshift({
+              id: `firstframe_${task.id}`,
+              kind: 'image',
+              name: firstFrameName,
+              absolutePath: framePath,
+            });
+            
+            if (!input.prompt.includes('= 首帧参考')) {
+              input.prompt = `@${firstFrameName} = 首帧参考\n\n${input.prompt}`;
+            }
+            console.log(`[SUBMIT] 首帧已添加: name=${firstFrameName}, path=${framePath}`);
+            console.log(`[SUBMIT] 添加首帧后prompt前150字: ${input.prompt.substring(0, 150)}`);
+            console.log(`[SUBMIT] 添加首帧后images: ${input.images.map(i=>i.name).join(',')}`);
+          }
+        }
+      }
+    } else if (prevStoryboard && prevStoryboard.status !== 'succeeded') {
+      console.log(`[SUBMIT] 上一分镜状态不是succeeded: ${prevStoryboard.status}, 跳过首帧获取`);
+    }
+  }
+
+  const { submitMode } = getSettings();
+  console.log(`[SUBMIT] 提交模式: ${submitMode}`);
+  
+  const allAssets = input.images.concat(input.videos).concat(input.audios);
+  console.log(`[SUBMIT] compilePromptReferences前, allAssets数量: ${allAssets.length}`);
+  console.log(`[SUBMIT] compilePromptReferences前, allAssets: ${allAssets.map(a=>`${a.kind}:${a.name}`).join(', ')}`);
+  
+  const promptData = compilePromptReferences(input.prompt, allAssets);
+  console.log(`[SUBMIT] compilePromptReferences后, prompt前200字: ${promptData.prompt.substring(0, 200)}`);
+  console.log(`[SUBMIT] uploadOrder: image=${JSON.stringify(promptData.uploadOrder.image)}, video=${JSON.stringify(promptData.uploadOrder.video)}, audio=${JSON.stringify(promptData.uploadOrder.audio)}`);
+  
+  const assetById = new Map(allAssets.map((a) => [a.id, a]));
+  const orderedImages = promptData.uploadOrder.image.map((id) => assetById.get(id)).filter(Boolean);
+  const orderedVideos = promptData.uploadOrder.video.map((id) => assetById.get(id)).filter(Boolean);
+  const orderedAudios = promptData.uploadOrder.audio.map((id) => assetById.get(id)).filter(Boolean);
+  
+  console.log(`[SUBMIT] 排序后: images=${orderedImages.map(i=>i.name).join(',')}, videos=${orderedVideos.map(v=>v.name).join(',')}, audios=${orderedAudios.map(a=>a.name).join(',')}`);
+  
+  if (submitMode === 'web') {
+    const webPayload = {
+      mode: 'web',
+      prompt: promptData.prompt,
+      images: orderedImages.map(i => ({ name: i.name, path: i.absolutePath })),
+      videos: orderedVideos.map(v => ({ name: v.name, path: v.absolutePath })),
+      audios: orderedAudios.map(a => ({ name: a.name, path: a.absolutePath })),
+      options: input.options,
+    };
+    
+    console.log(`[SUBMIT] Web模式, 保存web_pending状态`);
+    console.log(`[SUBMIT] Web payload prompt前200字: ${webPayload.prompt.substring(0, 200)}`);
+    console.log(`[SUBMIT] Web payload images: ${webPayload.images.map(i=>i.name).join(',')}`);
+    
+    database.prepare('update queue_tasks set status = ?, submit_id = ?, last_checked_at = ?, raw_json = ? where id = ?')
+      .run('web_pending', `web_${task.id}`, nowIso(), JSON.stringify(webPayload), task.id);
+    updateStoryboardStatus(task.storyboard_id, 'web_pending');
+    console.log(`[SUBMIT] Web模式提交完成`);
+    return;
+  }
+
+  const args = buildDreaminaArgs({
+    prompt: promptData.prompt,
+    images: orderedImages,
+    videos: orderedVideos,
+    audios: orderedAudios,
+    options: input.options,
+  });
+  console.log(`[SUBMIT] CLI模式, buildDreaminaArgs完成`);
+  const promptArg = args.find(a => a.startsWith('--prompt='));
+  console.log(`[SUBMIT] CLI args prompt前200字: ${promptArg ? promptArg.substring(0, 200) : '(none)'}`);
+  console.log(`[SUBMIT] CLI args images: ${orderedImages.length}个, videos: ${orderedVideos.length}个, audios: ${orderedAudios.length}个`);
+  
   const { payload } = await runDreaminaJson(args);
+  console.log(`[SUBMIT] runDreaminaJson返回: ${JSON.stringify(payload).substring(0, 300)}`);
+  
   const submitId = String(payload?.submit_id || payload?.submitId || '').trim();
   const genStatus = String(payload?.gen_status || payload?.genStatus || '').trim();
   if (!submitId) throw new Error('Dreamina did not return submit_id.');
   const status = mapRemoteStatus(genStatus);
+  console.log(`[SUBMIT] 提交成功: submitId=${submitId}, genStatus=${genStatus}, mappedStatus=${status}`);
+  
   database.prepare('update queue_tasks set status = ?, submit_id = ?, last_checked_at = ?, raw_json = ? where id = ?')
     .run(status, submitId, nowIso(), JSON.stringify(payload), task.id);
   updateStoryboardStatus(task.storyboard_id, status);
+  console.log(`[SUBMIT] 任务状态已更新: ${status}`);
+  console.log('===== [SUBMIT] 提交任务完成 =====');
 }
 
 async function pollQueueTask(task) {
@@ -529,25 +687,101 @@ async function pollQueueTask(task) {
     .run('running', checkedAt, new Date(Date.now() + waitMs).toISOString(), JSON.stringify(payload), task.id);
 }
 
+function resetStuckTasks() {
+  const database = initDb();
+  let resetCount = 0;
+
+  const stuckSubmitting = database.prepare("select * from queue_tasks where status = 'submitting' and started_at != '' and started_at <= ?").all(new Date(Date.now() - 5 * 60 * 1000).toISOString());
+  for (const stuck of stuckSubmitting) {
+    console.warn(`[QUEUE] submitting任务超时(>5min): id=${stuck.id}, sceneNo=${stuck.scene_no}, 重置为queued`);
+    database.prepare('update queue_tasks set status = ?, error = ?, started_at = ? where id = ?')
+      .run('queued', 'Timeout: stuck in submitting', '', stuck.id);
+    updateStoryboardStatus(stuck.storyboard_id, 'queued');
+    resetCount++;
+  }
+
+  const stuckRunning = database.prepare("select * from queue_tasks where status = 'running' and last_checked_at != '' and last_checked_at <= ?").all(new Date(Date.now() - 30 * 60 * 1000).toISOString());
+  for (const stuck of stuckRunning) {
+    console.warn(`[QUEUE] running任务超时(>30min无响应): id=${stuck.id}, sceneNo=${stuck.scene_no}, 重置为queued`);
+    database.prepare('update queue_tasks set status = ?, error = ?, started_at = ? where id = ?')
+      .run('queued', 'Timeout: running task unresponsive', '', stuck.id);
+    updateStoryboardStatus(stuck.storyboard_id, 'queued');
+    resetCount++;
+  }
+
+  const stuckWebPending = database.prepare("select * from queue_tasks where status = 'web_pending' and started_at != '' and started_at <= ?").all(new Date(Date.now() - 60 * 60 * 1000).toISOString());
+  for (const stuck of stuckWebPending) {
+    console.warn(`[QUEUE] web_pending任务超时(>60min): id=${stuck.id}, sceneNo=${stuck.scene_no}, 重置为queued`);
+    database.prepare('update queue_tasks set status = ?, error = ?, started_at = ? where id = ?')
+      .run('queued', 'Timeout: web_pending too long', '', stuck.id);
+    updateStoryboardStatus(stuck.storyboard_id, 'queued');
+    resetCount++;
+  }
+
+  if (processingQueue) {
+    const stuckTime = Date.now() - (globalThis.__queueLockTime || 0);
+    if (stuckTime > 10 * 60 * 1000) {
+      console.warn(`[QUEUE] processingQueue锁已持有${Math.round(stuckTime/1000)}秒，强制释放`);
+      processingQueue = false;
+      resetCount++;
+    }
+  }
+
+  return resetCount;
+}
+
 async function processQueue() {
-  if (processingQueue) return;
+  if (processingQueue) {
+    return;
+  }
   processingQueue = true;
+  globalThis.__queueLockTime = Date.now();
   try {
     const database = initDb();
+
+    const nonTerminal = database.prepare("select status, count(*) as cnt from queue_tasks where status not in ('succeeded', 'failed', 'cancelled') group by status").all();
+    if (nonTerminal.length === 0) return;
+
     const active = database.prepare("select * from queue_tasks where status in ('submitting', 'running') order by scene_no asc, created_at asc limit 1").get();
     if (active) {
-      if (active.status === 'running' && (!active.next_retry_at || Date.parse(active.next_retry_at) <= Date.now())) {
-        await pollQueueTask(active);
+      console.log(`[QUEUE] 发现活跃任务: id=${active.id}, sceneNo=${active.scene_no}, status=${active.status}`);
+      if (active.status === 'submitting') {
+        const startedAt = Date.parse(active.started_at || active.created_at);
+        const elapsed = Date.now() - startedAt;
+        console.log(`[QUEUE] submitting任务已耗时: ${Math.round(elapsed/1000)}秒`);
+      }
+      if (active.status === 'running') {
+        const nextRetry = active.next_retry_at ? Date.parse(active.next_retry_at) : 0;
+        const waitSec = nextRetry > Date.now() ? Math.round((nextRetry - Date.now()) / 1000) : 0;
+        console.log(`[QUEUE] running任务下次轮询等待: ${waitSec}秒`);
+        if (waitSec <= 0) {
+          console.log(`[QUEUE] 轮询running任务: id=${active.id}`);
+          await pollQueueTask(active);
+        }
       }
       return;
     }
 
+    const webPendingCount = database.prepare("select count(*) as cnt from queue_tasks where status = 'web_pending'").get();
+    if (webPendingCount.cnt > 0) {
+      console.log(`[QUEUE] 有${webPendingCount.cnt}个web_pending任务等待用户操作，不阻塞队列`);
+    }
+
     const next = database.prepare("select * from queue_tasks where status = 'queued' or (status = 'retry_wait' and (next_retry_at = '' or next_retry_at <= ?)) order by scene_no asc, created_at asc limit 1").get(nowIso());
-    if (!next) return;
+    if (!next) {
+      const retryWaitTasks = database.prepare("select id, scene_no, next_retry_at from queue_tasks where status = 'retry_wait' order by scene_no asc").all();
+      if (retryWaitTasks.length > 0) {
+        console.log(`[QUEUE] 有${retryWaitTasks.length}个retry_wait任务未到重试时间: ${retryWaitTasks.map(t => `sceneNo=${t.scene_no}, retryAt=${t.next_retry_at}`).join('; ')}`);
+      }
+      return;
+    }
+    console.log(`[QUEUE] 找到待提交任务: id=${next.id}, sceneNo=${next.scene_no}, status=${next.status}`);
     try {
       await submitQueueTask(next);
     } catch (error) {
       const message = String(error?.message || error || 'Submit failed.');
+      console.error(`[QUEUE] 提交任务失败: id=${next.id}, sceneNo=${next.scene_no}, error=${message}`);
+      console.error(`[QUEUE] 错误堆栈: ${error?.stack || '无堆栈'}`);
       const checkedAt = nowIso();
       if (isConcurrencyLimitError(message)) {
         const attempts = Number(next.attempt_count || 0) + 1;
@@ -560,6 +794,9 @@ async function processQueue() {
         updateStoryboardStatus(next.storyboard_id, 'failed');
       }
     }
+  } catch (outerError) {
+    console.error(`[QUEUE] processQueue外层错误: ${outerError?.message || outerError}`);
+    console.error(`[QUEUE] 外层错误堆栈: ${outerError?.stack || '无堆栈'}`);
   } finally {
     processingQueue = false;
   }
@@ -610,7 +847,7 @@ function configureRoutes(app) {
 
   app.put('/api/settings', (request, response) => {
     const body = request.body || {};
-    for (const key of ['materialRoot', 'outputRoot', 'cliBin']) {
+    for (const key of ['materialRoot', 'outputRoot', 'cliBin', 'submitMode']) {
       if (typeof body[key] === 'string' && body[key].trim()) setSetting(key, body[key].trim());
     }
     mkdirSync(getSettings().materialRoot, { recursive: true });
@@ -662,12 +899,96 @@ function configureRoutes(app) {
     response.json(getState());
   });
 
+  app.put('/api/storyboards/:id/continuation', (request, response) => {
+    const database = initDb();
+    const storyboardId = request.params.id;
+    const isContinuation = Boolean(request.body?.isContinuation);
+    
+    database.prepare('update storyboards set is_continuation = ? where id = ?')
+      .run(isContinuation ? 1 : 0, storyboardId);
+    
+    response.json(getState());
+  });
+
+  app.get('/api/storyboards/:id/last-frame', async (request, response) => {
+    const database = initDb();
+    const storyboardId = request.params.id;
+    
+    const storyboard = database.prepare('select * from storyboards where id = ?').get(storyboardId);
+    if (!storyboard) {
+      return response.status(404).json({ error: '分镜不存在' });
+    }
+    
+    const prevSceneNo = storyboard.scene_no - 1;
+    const prevStoryboard = database.prepare(
+      'select * from storyboards where project_id = ? and scene_no = ?'
+    ).get(storyboard.project_id, prevSceneNo);
+    
+    if (!prevStoryboard) {
+      return response.status(404).json({ error: '上一个分镜不存在' });
+    }
+    
+    if (prevStoryboard.status !== 'succeeded') {
+      return response.status(400).json({ error: '上一个分镜尚未完成' });
+    }
+    
+    const outputAssets = database.prepare(
+      'select * from output_assets where storyboard_id = ? and kind = \'video\''
+    ).all(prevStoryboard.id);
+    
+    if (outputAssets.length === 0) {
+      return response.status(404).json({ error: '上一个分镜没有视频输出' });
+    }
+    
+    const videoAsset = outputAssets[0];
+    const videoPath = safeResolve(getSettings().outputRoot, videoAsset.relative_path);
+    
+    if (!existsSync(videoPath)) {
+      return response.status(404).json({ error: '视频文件不存在' });
+    }
+    
+    try {
+      const outputDir = join(tmpdir(), 'dreamina-frames');
+      if (!existsSync(outputDir)) {
+        mkdirSync(outputDir, { recursive: true });
+      }
+      
+      const framePath = join(outputDir, `${prevStoryboard.id}-last-frame.png`);
+      const exec = promisify(execFile);
+      
+      await exec('ffmpeg', [
+        '-sseof', '-1',
+        '-i', videoPath,
+        '-vframes', '1',
+        '-q:v', '2',
+        framePath
+      ]);
+      
+      if (!existsSync(framePath)) {
+        return response.status(500).json({ error: '提取帧失败' });
+      }
+      
+      response.sendFile(framePath);
+    } catch (error) {
+      console.error('提取帧错误:', error);
+      response.status(500).json({ error: '提取帧失败: ' + (error instanceof Error ? error.message : '未知错误') });
+    }
+  });
+
   app.put('/api/storyboards/:id', (request, response) => {
     const prompt = String(request.body?.prompt || '');
     const overrides = request.body?.overrides && typeof request.body.overrides === 'object' ? request.body.overrides : {};
     const assetIds = Array.isArray(request.body?.assetIds) ? request.body.assetIds.map(String) : [];
-    initDb().prepare('update storyboards set prompt = ?, overrides_json = ?, asset_ids_json = ?, updated_at = ? where id = ?')
-      .run(prompt, JSON.stringify(overrides), JSON.stringify(assetIds), nowIso(), request.params.id);
+    const isContinuation = request.body?.isContinuation !== undefined ? (Boolean(request.body.isContinuation) ? 1 : 0) : undefined;
+    
+    const database = initDb();
+    if (isContinuation !== undefined) {
+      database.prepare('update storyboards set prompt = ?, overrides_json = ?, asset_ids_json = ?, is_continuation = ?, updated_at = ? where id = ?')
+        .run(prompt, JSON.stringify(overrides), JSON.stringify(assetIds), isContinuation, nowIso(), request.params.id);
+    } else {
+      database.prepare('update storyboards set prompt = ?, overrides_json = ?, asset_ids_json = ?, updated_at = ? where id = ?')
+        .run(prompt, JSON.stringify(overrides), JSON.stringify(assetIds), nowIso(), request.params.id);
+    }
     response.json(getState());
   });
 
@@ -723,6 +1044,82 @@ function configureRoutes(app) {
     response.sendFile(getAssetAbsolute(asset));
   });
 
+  app.get('/api/assets/:id/references', (request, response) => {
+    const database = initDb();
+    const assetId = request.params.id;
+    
+    const referencedStoryboards = database.prepare(
+      'select id, scene_no, project_id from storyboards where asset_ids_json like ?'
+    ).all(`%${assetId}%`);
+    
+    const referencedTasks = database.prepare(
+      "select id, scene_no, project_id from queue_tasks where status in ('queued', 'submitting', 'running', 'retry_wait') and prompt like ?"
+    ).all(`%@%`);
+    
+    const asset = database.prepare('select name from input_assets where id = ?').get(assetId);
+    const assetName = asset?.name || '未知素材';
+    
+    const storyboardDetails = referencedStoryboards.map(storyboard => {
+      const project = database.prepare('select name from projects where id = ?').get(storyboard.project_id);
+      return {
+        id: storyboard.id,
+        sceneNo: storyboard.scene_no,
+        projectName: project?.name || '未知项目',
+      };
+    });
+    
+    const hasPendingTasks = referencedTasks.some(task => {
+      return referencedStoryboards.some(sb => sb.id === task.id);
+    });
+    
+    response.json({
+      assetId,
+      assetName,
+      referenced: referencedStoryboards.length > 0,
+      hasPendingTasks,
+      storyboards: storyboardDetails,
+    });
+  });
+
+  app.delete('/api/assets/:id', (request, response) => {
+    const database = initDb();
+    const assetId = request.params.id;
+    
+    const asset = database.prepare('select * from input_assets where id = ?').get(assetId);
+    if (!asset) return response.status(404).json({ error: 'Asset not found.' });
+    
+    const referencedStoryboards = database.prepare(
+      'select id, scene_no, project_id from storyboards where asset_ids_json like ?'
+    ).all(`%${assetId}%`);
+    
+    if (referencedStoryboards.length > 0) {
+      const storyboardDetails = referencedStoryboards.map(storyboard => {
+        const project = database.prepare('select name from projects where id = ?').get(storyboard.project_id);
+        return {
+          sceneNo: storyboard.scene_no,
+          projectName: project?.name || '未知项目',
+        };
+      });
+      
+      return response.status(400).json({
+        error: '该素材被分镜引用，无法删除',
+        referencedBy: storyboardDetails,
+      });
+    }
+    
+    database.prepare('delete from input_assets where id = ?').run(assetId);
+    
+    const absolutePath = getAssetAbsolute(asset);
+    try {
+      if (existsSync(absolutePath)) {
+        unlinkSync(absolutePath);
+      }
+    } catch {
+    }
+    
+    response.json(getState());
+  });
+
   app.get('/api/outputs/:id/file', (request, response) => {
     const asset = initDb().prepare('select * from output_assets where id = ?').get(request.params.id);
     if (!asset) return response.status(404).json({ error: 'Output not found.' });
@@ -752,6 +1149,31 @@ function configureRoutes(app) {
   app.post('/api/queue/process', async (_request, response) => {
     await processQueue();
     response.json(getState());
+  });
+
+  app.post('/api/queue/reset-stuck', (request, response) => {
+    const database = initDb();
+    const resetStatuses = ['submitting', 'running', 'web_pending', 'retry_wait'];
+    let resetCount = 0;
+    for (const status of resetStatuses) {
+      const result = database.prepare('update queue_tasks set status = ?, error = ?, started_at = ?, next_retry_at = ? where status = ?')
+        .run('queued', `Reset from ${status}`, '', '', status);
+      resetCount += result.changes;
+    }
+    const stuckStoryboards = database.prepare("select distinct storyboard_id from queue_tasks where status = 'queued'").all();
+    for (const row of stuckStoryboards) {
+      updateStoryboardStatus(row.storyboard_id, 'queued');
+    }
+    console.log(`[QUEUE] 手动重置了${resetCount}个卡住的任务`);
+    void processQueue();
+    response.json({ ...getState(), resetCount });
+  });
+
+  app.get('/api/queue/diagnose', (request, response) => {
+    const database = initDb();
+    const statusCounts = database.prepare("select status, count(*) as cnt from queue_tasks group by status").all();
+    const nonTerminalTasks = database.prepare("select id, scene_no, status, error, started_at, last_checked_at, next_retry_at, attempt_count from queue_tasks where status not in ('succeeded', 'failed', 'cancelled') order by scene_no asc").all();
+    response.json({ statusCounts, nonTerminalTasks, processingQueue, now: nowIso() });
   });
 
   app.post('/api/queue/:id/retry', (request, response) => {
@@ -793,23 +1215,64 @@ function configureRoutes(app) {
   });
 
   app.get('/api/jimeng/health', async (_request, response) => {
-    const { cliBin } = getSettings();
+    const { cliBin, submitMode } = getSettings();
+    let cliAvailable = true;
+    let loginStatus = 'unknown';
+    let credit = null;
+    let error = null;
+    
     try {
       await execFileAsync(cliBin, ['-h'], { maxBuffer: 2 * 1024 * 1024 });
-    } catch (error) {
-      return response.json({ cliAvailable: false, loginStatus: 'unknown', modelVersions, error: String(error?.message || error), checkedAt: nowIso() });
+      try {
+        const creditResult = await runDreaminaJson(['user_credit']);
+        loginStatus = 'logged_in';
+        credit = creditResult.payload;
+      } catch (e) {
+        loginStatus = 'logged_out';
+        error = String(e?.message || e);
+      }
+    } catch (e) {
+      cliAvailable = false;
+      error = String(e?.message || e);
     }
-    try {
-      const credit = await runDreaminaJson(['user_credit']);
-      response.json({ cliAvailable: true, loginStatus: 'logged_in', modelVersions, credit: credit.payload, checkedAt: nowIso() });
-    } catch (error) {
-      response.json({ cliAvailable: true, loginStatus: 'logged_out', modelVersions, error: String(error?.message || error), checkedAt: nowIso() });
-    }
+    
+    response.json({ 
+      cliAvailable, 
+      loginStatus, 
+      modelVersions, 
+      credit, 
+      error, 
+      checkedAt: nowIso(),
+      submitMode,
+      availableModes: ['cli', 'web'],
+    });
   });
 
   app.post('/api/jimeng/tasks', async (request, response) => {
     try {
       const input = request.body || {};
+      const { submitMode } = getSettings();
+      
+      if (submitMode === 'web') {
+        const options = normalizeDefaults(input.options);
+        const promptData = compilePromptReferences(input.prompt || '', [...(input.images || []), ...(input.videos || []), ...(input.audios || [])]);
+        
+        response.json({ 
+          mode: 'web',
+          submitId: `web_${randomUUID()}`,
+          genStatus: 'pending',
+          prompt: promptData.prompt,
+          assets: {
+            images: input.images || [],
+            videos: input.videos || [],
+            audios: input.audios || [],
+          },
+          options: options,
+          instruction: '请打开即梦网页版，手动上传素材并粘贴以下提示词:',
+        });
+        return;
+      }
+      
       const options = normalizeDefaults(input.options);
       const result = await runDreaminaJson(buildDreaminaArgs({ ...input, options, images: input.images || [], videos: input.videos || [], audios: input.audios || [] }));
       response.json({ submitId: result.payload?.submit_id || result.payload?.submitId || '', genStatus: result.payload?.gen_status || result.payload?.genStatus || '', raw: result.payload });
@@ -844,7 +1307,10 @@ export async function startJimengBridge(options = {}) {
   configureRoutes(app);
   const port = Number(options.port || DEFAULT_PORT);
   const server = app.listen(port, '127.0.0.1');
-  const interval = setInterval(() => void processQueue(), 5000);
+  const interval = setInterval(() => {
+    resetStuckTasks();
+    void processQueue();
+  }, 5000);
   return {
     port,
     close() {
@@ -854,7 +1320,7 @@ export async function startJimengBridge(options = {}) {
   };
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+if (isStandalone) {
   startJimengBridge({ port: DEFAULT_PORT }).then(({ port }) => {
     console.log(`Jimeng bridge listening on http://127.0.0.1:${port}`);
   });

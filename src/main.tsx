@@ -1,6 +1,6 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import { AlertCircle, Check, Download, FolderPlus, HeartPulse, Image, Library, ListPlus, Play, Plus, RefreshCw, Save, Settings, Upload, Video } from 'lucide-react';
+import { AlertCircle, Camera, Check, Download, FolderPlus, HeartPulse, Image, Library, ListPlus, Play, Plus, RefreshCw, Save, Settings, Upload, Video } from 'lucide-react';
 import type { AppState, AssetKind, Group, InputAsset, Project, ProjectDefaults, QueueTask, Storyboard } from './shared/types';
 import { DEFAULT_PROJECT_DEFAULTS } from './shared/types';
 import { MODEL_VERSIONS, modelLabel, normalizeModelVersion } from './shared/jimeng';
@@ -29,7 +29,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 function emptyState(): AppState {
   return {
-    settings: { materialRoot: '', outputRoot: '', cliBin: 'dreamina' },
+    settings: { materialRoot: '', outputRoot: '', cliBin: 'dreamina', submitMode: 'cli' },
     groups: [],
     projects: [],
     storyboards: [],
@@ -64,12 +64,58 @@ function kindFromMime(mime: string): AssetKind {
 }
 
 function StatusPill({ status }: { status: string }) {
-  return <span className={`pill pill-${status}`}>{status}</span>;
+  const labels: Record<string, string> = {
+    'web_pending': '待网页提交',
+    'queued': '排队中',
+    'submitting': '提交中',
+    'running': '生成中',
+    'succeeded': '已完成',
+    'failed': '失败',
+    'cancelled': '已取消',
+    'retry_wait': '等待重试',
+  };
+  return <span className={`pill pill-${status}`}>{labels[status] || status}</span>;
 }
 
-function AssetPreview({ asset }: { asset: InputAsset }) {
+function AssetPreview({ asset, onCaptureFrame }: { asset: InputAsset; onCaptureFrame?: (asset: InputAsset, frameData: string) => void }) {
+  const videoRef = React.useRef<HTMLVideoElement>(null);
+
   if (asset.kind === 'image') return <img src={assetUrl(asset.previewUrl)} alt={asset.name} />;
-  if (asset.kind === 'video') return <video src={assetUrl(asset.previewUrl)} muted controls />;
+  if (asset.kind === 'video') {
+    return (
+      <div className="video-container">
+        <video 
+          ref={videoRef} 
+          src={assetUrl(asset.previewUrl)} 
+          muted 
+          controls 
+          className="asset-video"
+        />
+        {onCaptureFrame && (
+          <div className="video-controls-overlay">
+            <button 
+              className="capture-frame-btn"
+              onClick={() => {
+                const video = videoRef.current;
+                if (video) {
+                  const canvas = document.createElement('canvas');
+                  canvas.width = video.videoWidth;
+                  canvas.height = video.videoHeight;
+                  const ctx = canvas.getContext('2d');
+                  ctx?.drawImage(video, 0, 0);
+                  const frameDataUrl = canvas.toDataURL('image/png');
+                  onCaptureFrame(asset, frameDataUrl);
+                }
+              }}
+            >
+              <Camera size={16} />
+              <span>获取静帧</span>
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  }
   return <div className="asset-audio">音频</div>;
 }
 
@@ -95,12 +141,18 @@ function App() {
   const [currentFile, setCurrentFile] = React.useState<File | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const [groupDialog, setGroupDialog] = React.useState(false);
+  const [storyboardDirty, setStoryboardDirty] = React.useState(false);
+  const [dirtyConfirmPending, setDirtyConfirmPending] = React.useState<{ type: 'switchStoryboard' | 'switchView' | 'none'; target?: any }>({ type: 'none' });
   const [newGroupName, setNewGroupName] = React.useState('新分组');
   const [collapsedGroups, setCollapsedGroups] = React.useState<Set<string>>(new Set());
   const [deleteConfirm, setDeleteConfirm] = React.useState<{ type: 'group' | 'project'; id: string; name: string } | null>(null);
   const [batchEditDialog, setBatchEditDialog] = React.useState(false);
   const [batchEditParams, setBatchEditParams] = React.useState<ProjectDefaults>(DEFAULT_PROJECT_DEFAULTS);
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(false);
+  const currentEditorRef = React.useRef<{ prompt: string; overrides: Partial<ProjectDefaults>; assetIds: string[] } | null>(null);
+  const [capturedFrame, setCapturedFrame] = React.useState<string | null>(null);
+  const [capturedFrameAsset, setCapturedFrameAsset] = React.useState<InputAsset | null>(null);
+  const [frameDialogOpen, setFrameDialogOpen] = React.useState(false);
 
   const refresh = React.useCallback(async () => {
     setIsPolling(true);
@@ -116,7 +168,7 @@ function App() {
 
   React.useEffect(() => {
     void refresh();
-    const interval = window.setInterval(() => void refresh(), 5000);
+    const interval = window.setInterval(() => void refresh(), 30000);
     return () => window.clearInterval(interval);
   }, [refresh]);
 
@@ -126,7 +178,7 @@ function App() {
   const selectedStoryboard = state.storyboards.find((storyboard) => storyboard.id === selectedStoryboardId) || projectStoryboards[0];
   const projectAssets = state.inputAssets.filter((asset) => asset.projectId === selectedProjectId);
   const projectOutputs = state.outputAssets.filter((asset) => asset.projectId === selectedProjectId);
-  const projectQueue = state.queueTasks.filter((task) => task.projectId === selectedProjectId);
+  const projectQueue = state.queueTasks.filter((task) => task.projectId === selectedProjectId).sort((a, b) => a.sceneNo - b.sceneNo);
 
   React.useEffect(() => {
     if (!selectedStoryboardId && projectStoryboards[0]) setSelectedStoryboardId(projectStoryboards[0].id);
@@ -245,10 +297,31 @@ function App() {
       prompt: patch.prompt ?? storyboard.prompt,
       overrides: patch.overrides ?? storyboard.overrides,
       assetIds: patch.assetIds ?? storyboard.assetIds,
+      isContinuation: patch.isContinuation ?? storyboard.isContinuation,
     }, 'PUT');
     setSavedStoryboardId(storyboard.id);
     window.setTimeout(() => setSavedStoryboardId((current) => current === storyboard.id ? '' : current), 1800);
     setToast(`分镜 ${storyboard.sceneNo} 已保存`);
+  }
+
+  async function handleSaveCurrentAndSwitch(targetStoryboardId: string) {
+    if (selectedStoryboard) {
+      const editorState = currentEditorRef.current;
+      await saveStoryboard(selectedStoryboard, {
+        prompt: editorState?.prompt ?? selectedStoryboard.prompt,
+        overrides: editorState?.overrides ?? selectedStoryboard.overrides,
+        assetIds: editorState?.assetIds ?? selectedStoryboard.assetIds,
+      });
+    }
+    setSelectedStoryboardId(targetStoryboardId);
+  }
+
+  function handleSetView(newView: 'workbench' | 'settings') {
+    if (storyboardDirty) {
+      setDirtyConfirmPending({ type: 'switchView', target: newView });
+    } else {
+      setView(newView);
+    }
   }
 
   async function handleFiles(files: FileList | null) {
@@ -685,7 +758,7 @@ function App() {
                       onClick={() => {
                         setSelectedProjectId(project.id);
                         setSelectedGroupId(project.groupId);
-                        setView('workbench');
+                        handleSetView('workbench');
                       }}
                     >
                       {project.name}
@@ -708,7 +781,7 @@ function App() {
           </div>
         )}
 
-        <button className={`settings-link ${view === 'settings' ? 'active' : ''}`} onClick={() => setView(view === 'settings' ? 'workbench' : 'settings')}>
+        <button className={`settings-link ${view === 'settings' ? 'active' : ''}`} onClick={() => handleSetView(view === 'settings' ? 'workbench' : 'settings')}>
           <Settings size={16} />{view === 'settings' ? '返回工作台' : '设置'}
         </button>
       </aside>
@@ -717,7 +790,7 @@ function App() {
         <header className="topbar">
           <div style={{ display: 'flex', alignItems: 'center', gap: '16px', flexWrap: 'wrap' }}>
             {view === 'settings' && (
-              <button className="mini-button" onClick={() => setView('workbench')}>
+              <button className="mini-button" onClick={() => handleSetView('workbench')}>
                 ← 返回工作台
               </button>
             )}
@@ -779,9 +852,16 @@ function App() {
                     />
                     <button
                       className={`scene-row ${selectedStoryboard?.id === storyboard.id ? 'active' : ''}`}
-                      onClick={() => setSelectedStoryboardId(storyboard.id)}
+                      onClick={() => {
+                        if (storyboard.id === selectedStoryboard?.id) return;
+                        if (storyboardDirty) {
+                          setDirtyConfirmPending({ type: 'switchStoryboard', target: storyboard.id });
+                        } else {
+                          setSelectedStoryboardId(storyboard.id);
+                        }
+                      }}
                     >
-                      <span>分镜 {storyboard.sceneNo}</span>
+                      <span>分镜 {storyboard.sceneNo}{storyboard.isContinuation ? ' 🔗' : ''}</span>
                       <StatusPill status={storyboard.status} />
                     </button>
                   </div>
@@ -800,6 +880,9 @@ function App() {
                   onEnqueue={enqueueSelected}
                   onEnqueueAll={enqueueAllReady}
                   savedSignal={savedStoryboardId === selectedStoryboard.id}
+                  onDirtyChange={setStoryboardDirty}
+                  onEditorStateChange={(state) => { currentEditorRef.current = state; }}
+                  onRefresh={refresh}
                 />
               )}
             </section>
@@ -817,8 +900,49 @@ function App() {
                 <div className="asset-grid">
                   {projectAssets.map((asset) => (
                     <article key={asset.id} className="asset-card">
-                      <AssetPreview asset={asset} />
-                      <span>@{asset.name}</span>
+                      <AssetPreview 
+                        asset={asset} 
+                        onCaptureFrame={(asset, frameData) => {
+                          setCapturedFrame(frameData);
+                          setCapturedFrameAsset(asset);
+                          setFrameDialogOpen(true);
+                        }}
+                      />
+                      <div className="asset-card-footer">
+                        <span>@{asset.name}</span>
+                        <button 
+                          className="asset-delete-btn"
+                          onClick={async () => {
+                            try {
+                              const response = await fetch(`${apiBase}/api/assets/${asset.id}/references`);
+                              const data = await response.json();
+                              
+                              if (data.referenced) {
+                                const refs = data.storyboards.map((sb: any) => `项目「${sb.projectName}」分镜${sb.sceneNo}`).join('\n');
+                                alert(`该素材被以下分镜引用，无法删除：\n\n${refs}`);
+                                return;
+                              }
+                              
+                              if (confirm(`确定删除素材 "@${asset.name}" 吗？`)) {
+                                const deleteResponse = await fetch(`${apiBase}/api/assets/${asset.id}`, {
+                                  method: 'DELETE',
+                                });
+                                if (deleteResponse.ok) {
+                                  await refresh();
+                                  setToast(`素材 "@${asset.name}" 已删除`);
+                                } else {
+                                  const errorData = await deleteResponse.json();
+                                  alert('删除失败: ' + (errorData.error || '未知错误'));
+                                }
+                              }
+                            } catch (error) {
+                              alert('删除失败: ' + (error instanceof Error ? error.message : '网络错误'));
+                            }
+                          }}
+                        >
+                          ✕
+                        </button>
+                      </div>
                     </article>
                   ))}
                 </div>
@@ -831,6 +955,22 @@ function App() {
                   <span className={`polling-indicator ${isPolling ? 'active' : ''}`}>
                     {isPolling ? '轮询中...' : '已连接'}
                   </span>
+                  <button
+                    className="mini-button"
+                    style={{ marginLeft: 'auto', fontSize: '11px' }}
+                    onClick={async () => {
+                      try {
+                        const res = await fetch('/api/queue/reset-stuck', { method: 'POST' });
+                        if (res.ok) {
+                          const data = await res.json();
+                          await refresh();
+                          setToast(data.resetCount > 0 ? `已重置${data.resetCount}个卡住的任务` : '没有卡住的任务');
+                        }
+                      } catch {}
+                    }}
+                  >
+                    重置卡住任务
+                  </button>
                 </div>
                 {projectQueue.map((task: QueueTask) => (
                   <div key={task.id} className="queue-row">
@@ -900,6 +1040,84 @@ function App() {
                         </button>
                       </div>
                     )}
+                    {task.status === 'web_pending' && (
+                      <div style={{ marginTop: '8px', padding: '10px', background: '#fef3cd', borderRadius: '6px', fontSize: '13px' }}>
+                        <div style={{ fontWeight: 'bold', color: '#856404', marginBottom: '6px' }}>📋 网页模式待提交</div>
+                        <div style={{ marginBottom: '10px' }}>
+                          <button
+                            style={{
+                              background: '#186a63',
+                              color: 'white',
+                              border: 'none',
+                              borderRadius: '6px',
+                              padding: '6px 14px',
+                              fontSize: '13px',
+                              cursor: 'pointer',
+                            }}
+                            onClick={async () => {
+                              const raw = task.raw_json ? JSON.parse(task.raw_json) : null;
+                              if (!raw) return;
+                              try {
+                                const result = await (window as any).jimengDesktop.openJimengWeb({
+                                  prompt: raw.prompt,
+                                  assets: raw.assets,
+                                  options: raw.options,
+                                });
+                                if (result.success) {
+                                  alert('浏览器已打开，提示词已自动填充！');
+                                } else {
+                                  alert('打开失败: ' + result.error);
+                                }
+                              } catch (err) {
+                                alert('打开浏览器失败: ' + String(err));
+                              }
+                            }}
+                          >
+                            🌐 一键打开浏览器（自动填充）
+                          </button>
+                        </div>
+                        <div style={{ marginBottom: '6px' }}>
+                          <strong>提示词：</strong>
+                          <button
+                            className="mini-button"
+                            style={{ marginLeft: '8px', padding: '2px 8px', fontSize: '11px' }}
+                            onClick={() => {
+                              const raw = task.raw_json ? JSON.parse(task.raw_json) : null;
+                              if (raw?.prompt) {
+                                navigator.clipboard.writeText(raw.prompt);
+                              }
+                            }}
+                          >
+                            复制提示词
+                          </button>
+                        </div>
+                        {task.raw_json && (() => {
+                          const raw = JSON.parse(task.raw_json);
+                          return raw?.prompt ? (
+                            <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', maxHeight: '80px', overflow: 'auto', background: '#fff', padding: '6px', borderRadius: '4px', marginBottom: '6px', fontSize: '11px' }}>
+                              {raw.prompt}
+                            </pre>
+                          ) : null;
+                        })()}
+                        {task.raw_json && (() => {
+                          const raw = JSON.parse(task.raw_json);
+                          const hasAssets = (raw?.images?.length || 0) + (raw?.videos?.length || 0) + (raw?.audios?.length || 0) > 0;
+                          return hasAssets ? (
+                            <div style={{ fontSize: '12px', color: '#666' }}>
+                              <strong>素材文件：</strong>
+                              <ul style={{ margin: '4px 0', paddingLeft: '16px' }}>
+                                {raw?.images?.map((img: any) => <li key={img.path}>🖼️ {img.path}</li>)}
+                                {raw?.videos?.map((vid: any) => <li key={vid.path}>🎬 {vid.path}</li>)}
+                                {raw?.audios?.map((aud: any) => <li key={aud.path}>🔊 {aud.path}</li>)}
+                              </ul>
+                            </div>
+                          ) : null;
+                        })()}
+                        <div style={{ fontSize: '11px', color: '#856404', marginTop: '6px' }}>
+                          提示词已自动填充，请手动上传素材和点击提交
+                        </div>
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -908,9 +1126,34 @@ function App() {
                 <div className="panel-title"><Download size={17} /><strong>资产库</strong></div>
                 {projectOutputs.map((asset) => (
                   <article key={asset.id} className="output-card">
-                    {asset.kind === 'video'
-                      ? <video src={assetUrl(asset.previewUrl)} controls />
-                      : <img src={assetUrl(asset.previewUrl)} alt={asset.filename} />}
+                    {asset.kind === 'video' ? (
+                      <div className="video-container">
+                        <video src={assetUrl(asset.previewUrl)} controls className="asset-video" />
+                        <div className="video-controls-overlay">
+                          <button 
+                            className="capture-frame-btn"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const video = (e.target as HTMLElement).closest('.video-container')?.querySelector('video');
+                              if (video) {
+                                const canvas = document.createElement('canvas');
+                                canvas.width = video.videoWidth;
+                                canvas.height = video.videoHeight;
+                                const ctx = canvas.getContext('2d');
+                                ctx?.drawImage(video, 0, 0);
+                                const frameDataUrl = canvas.toDataURL('image/png');
+                                setCapturedFrame(frameDataUrl);
+                                setCapturedFrameAsset({ name: `分镜${asset.sceneNo}`, id: asset.id, kind: 'video' } as InputAsset);
+                                setFrameDialogOpen(true);
+                              }
+                            }}
+                          >
+                            <Camera size={16} />
+                            <span>获取静帧</span>
+                          </button>
+                        </div>
+                      </div>
+                    ) : <img src={assetUrl(asset.previewUrl)} alt={asset.filename} />}
                     <a href={assetUrl(asset.previewUrl)} download>{`分镜 ${asset.sceneNo} · ${asset.filename}`}</a>
                   </article>
                 ))}
@@ -1194,6 +1437,175 @@ function App() {
           </div>
         </div>
       )}
+
+      {dirtyConfirmPending.type !== 'none' && (
+        <div
+          className="modal-backdrop"
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: 'rgba(8, 18, 17, .42)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 99999,
+            padding: '20px'
+          }}
+        >
+          <div
+            style={{
+              background: '#fbfdfc',
+              borderRadius: '8px',
+              padding: '30px',
+              boxShadow: '0 24px 60px rgba(0,0,0,.22)',
+              width: '100%',
+              maxWidth: '400px',
+              position: 'relative',
+              zIndex: 100000
+            }}
+          >
+            <h2 style={{ marginTop: 0, marginBottom: '15px' }}>有未保存的修改</h2>
+            <p style={{ marginBottom: '25px' }}>当前分镜有未保存的修改，是否先保存？</p>
+            <div style={{ display: 'flex', gap: '10px' }}>
+              <button
+                onClick={() => {
+                  setDirtyConfirmPending({ type: 'none' });
+                  setStoryboardDirty(false);
+                }}
+                style={{
+                  background: '#e8eeed',
+                  color: '#23413e',
+                  minHeight: '40px',
+                  padding: '10px 20px',
+                  border: 'none',
+                  borderRadius: '7px',
+                  cursor: 'pointer',
+                  flex: 1
+                }}
+              >放弃修改</button>
+              <button
+                onClick={async () => {
+                  const pending = dirtyConfirmPending;
+                  setDirtyConfirmPending({ type: 'none' });
+                  if (pending.type === 'switchStoryboard' && pending.target) {
+                    setStoryboardDirty(false);
+                    await handleSaveCurrentAndSwitch(pending.target);
+                  } else if (pending.type === 'switchView') {
+                    setStoryboardDirty(false);
+                    setView(pending.target);
+                  }
+                }}
+                style={{
+                  background: '#186a63',
+                  color: 'white',
+                  minHeight: '40px',
+                  padding: '10px 20px',
+                  border: 'none',
+                  borderRadius: '7px',
+                  cursor: 'pointer',
+                  flex: 1
+                }}
+              >保存并继续</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <FrameCaptureDialog
+        isOpen={frameDialogOpen}
+        onClose={() => {
+          setFrameDialogOpen(false);
+          setCapturedFrame(null);
+          setCapturedFrameAsset(null);
+        }}
+        frameData={capturedFrame || ''}
+        asset={capturedFrameAsset || {} as InputAsset}
+        storyboards={projectStoryboards}
+        onSaveToAssets={async () => {
+          if (!capturedFrame || !selectedProjectId) return;
+          
+          try {
+            const base64Data = capturedFrame.split(',')[1];
+            const fileName = `${capturedFrameAsset?.name || 'frame'}_${Date.now()}.png`;
+            
+            const data = await api<AppState>('/api/assets', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                projectId: selectedProjectId,
+                kind: 'image',
+                name: fileName.replace('.png', ''),
+                filename: fileName,
+                dataBase64: base64Data,
+              }),
+            });
+            
+            setState(data);
+            setToast('静帧已保存到项目素材库');
+          } catch (error) {
+            alert('保存失败: ' + (error instanceof Error ? error.message : '网络错误'));
+          }
+          
+          setFrameDialogOpen(false);
+          setCapturedFrame(null);
+          setCapturedFrameAsset(null);
+        }}
+        onSetAsFirstFrame={async (storyboardId: string) => {
+          if (!capturedFrame || !selectedProjectId) return;
+          
+          try {
+            const base64Data = capturedFrame.split(',')[1];
+            const assetName = `首帧_${capturedFrameAsset?.name || 'frame'}_${Date.now()}`;
+            const fileName = `${assetName}.png`;
+            
+            const data = await api<AppState>('/api/assets', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                projectId: selectedProjectId,
+                kind: 'image',
+                name: assetName,
+                filename: fileName,
+                dataBase64: base64Data,
+              }),
+            });
+            
+            setState(data);
+            
+            const newAsset = data.inputAssets[data.inputAssets.length - 1];
+            if (newAsset) {
+              const sb = data.storyboards.find((s) => s.id === storyboardId);
+              if (sb) {
+                const newAssetIds = [...sb.assetIds, newAsset.id];
+                const newOverrides = { ...sb.overrides, firstFrameAssetId: newAsset.id };
+                
+                await api(`/api/storyboards/${storyboardId}`, {
+                  method: 'PUT',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    prompt: sb.prompt.includes('= 首帧参考') ? sb.prompt : `@${newAsset.name} = 首帧参考\n\n${sb.prompt}`,
+                    overrides: newOverrides,
+                    assetIds: newAssetIds,
+                    isContinuation: sb.isContinuation,
+                  }),
+                });
+                
+                await refresh();
+                setToast(`静帧已设为分镜 ${sb.sceneNo} 的首帧素材`);
+              }
+            }
+          } catch (error) {
+            alert('设置首帧失败: ' + (error instanceof Error ? error.message : '网络错误'));
+          }
+          
+          setFrameDialogOpen(false);
+          setCapturedFrame(null);
+          setCapturedFrameAsset(null);
+        }}
+      />
     </main>
   );
 }
@@ -1235,7 +1647,7 @@ function DefaultsForm({ value, onChange }: { value: ProjectDefaults; onChange: (
   );
 }
 
-function StoryboardEditor({ storyboard, assets, options, onSave, onEnqueue, onEnqueueAll, savedSignal }: {
+function StoryboardEditor({ storyboard, assets, options, onSave, onEnqueue, onEnqueueAll, savedSignal, onDirtyChange, onEditorStateChange, onRefresh }: {
   storyboard: Storyboard;
   assets: InputAsset[];
   options: ProjectDefaults;
@@ -1243,6 +1655,9 @@ function StoryboardEditor({ storyboard, assets, options, onSave, onEnqueue, onEn
   onEnqueue: () => Promise<void>;
   onEnqueueAll: () => Promise<void>;
   savedSignal: boolean;
+  onDirtyChange?: (dirty: boolean) => void;
+  onEditorStateChange?: (state: { prompt: string; overrides: Partial<ProjectDefaults>; assetIds: string[] }) => void;
+  onRefresh?: () => Promise<void>;
 }) {
   const [prompt, setPrompt] = React.useState(storyboard.prompt);
   const [assetIds, setAssetIds] = React.useState(storyboard.assetIds);
@@ -1251,16 +1666,37 @@ function StoryboardEditor({ storyboard, assets, options, onSave, onEnqueue, onEn
   const [saveState, setSaveState] = React.useState<'idle' | 'saving' | 'saved'>('idle');
   const [showAssetPicker, setShowAssetPicker] = React.useState(false);
   const [hoveredAsset, setHoveredAsset] = React.useState<InputAsset | null>(null);
+  const [firstFrameAsset, setFirstFrameAsset] = React.useState<InputAsset | null>(null);
   const hoverTimerRef = React.useRef<NodeJS.Timeout | null>(null);
   const promptRef = React.useRef<HTMLTextAreaElement | null>(null);
+  const firstFrameFileInputRef = React.useRef<HTMLInputElement>(null);
+
+  React.useEffect(() => {
+    const firstFrameId = storyboard.overrides?.firstFrameAssetId;
+    if (firstFrameId) {
+      const asset = assets.find(a => a.id === firstFrameId);
+      setFirstFrameAsset(asset || null);
+    } else {
+      setFirstFrameAsset(null);
+    }
+  }, [storyboard.id, assets]);
 
   React.useEffect(() => {
     setPrompt(storyboard.prompt);
     setAssetIds(storyboard.assetIds);
     setOverrides(storyboard.overrides);
+    setIsContinuation(!!storyboard.isContinuation);
     setDirty(false);
     setShowAssetPicker(false);
   }, [storyboard.id]);
+
+  React.useEffect(() => {
+    onDirtyChange?.(dirty);
+  }, [dirty, onDirtyChange]);
+
+  React.useEffect(() => {
+    onEditorStateChange?.({ prompt, overrides, assetIds });
+  }, [prompt, overrides, assetIds, onEditorStateChange]);
 
   React.useEffect(() => {
     if (savedSignal) {
@@ -1273,12 +1709,40 @@ function StoryboardEditor({ storyboard, assets, options, onSave, onEnqueue, onEn
   }, [savedSignal]);
 
   const mergedOptions = { ...options, ...overrides };
+  const [isContinuation, setIsContinuation] = React.useState(!!storyboard.isContinuation);
+
+  const handleContinuationChange = async (checked: boolean) => {
+    setIsContinuation(checked);
+    try {
+      await api(`/api/storyboards/${storyboard.id}/continuation`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ isContinuation: checked }),
+      });
+      if (onRefresh) await onRefresh();
+    } catch (error) {
+      alert('保存连续分镜设置失败: ' + (error instanceof Error ? error.message : '网络错误'));
+    }
+  };
 
   return (
     <>
       <div className="panel-title editor-title">
         <strong>分镜 {storyboard.sceneNo}</strong>
         <StatusPill status={storyboard.status} />
+        <label className="continuation-toggle">
+          <input
+            type="checkbox"
+            checked={isContinuation}
+            onChange={(e) => handleContinuationChange(e.target.checked)}
+          />
+          <span>连续分镜</span>
+        </label>
+        {isContinuation && (
+          <div className="continuation-hint">
+            将自动获取上一分镜的最后一帧作为首帧
+          </div>
+        )}
       </div>
       <textarea
         ref={promptRef}
@@ -1345,18 +1809,156 @@ function StoryboardEditor({ storyboard, assets, options, onSave, onEnqueue, onEn
 
       <div className="asset-select-list">
         {assets.map((asset) => (
-          <label key={asset.id} className="asset-toggle">
+          <label 
+            key={asset.id} 
+            className="asset-toggle"
+            onMouseEnter={() => {
+              if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
+              hoverTimerRef.current = setTimeout(() => {
+                setHoveredAsset(asset);
+              }, 300);
+            }}
+            onMouseLeave={() => {
+              if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
+              setHoveredAsset(null);
+            }}
+          >
             <input
               type="checkbox"
               checked={assetIds.includes(asset.id)}
               onChange={(event) => {
-                setAssetIds((current) => event.target.checked ? [...current, asset.id] : current.filter((id) => id !== asset.id));
+                const newAssetIds = event.target.checked 
+                  ? [...assetIds, asset.id] 
+                  : assetIds.filter((id) => id !== asset.id);
+                setAssetIds(newAssetIds);
+                
+                const selectedAssets = newAssetIds
+                  .map(id => assets.find(a => a.id === id))
+                  .filter(Boolean);
+                
+                const assetLines = selectedAssets.map(a => `@${a!.name}`).join('\n');
+                
+                const assetNames = new Set(selectedAssets.map(a => a!.name));
+                
+                const lines = prompt.split('\n');
+                const nonAssetLines = lines.filter(line => {
+                  if (!line.startsWith('@')) return true;
+                  const name = line.slice(1);
+                  return !assetNames.has(name);
+                });
+                const promptBody = nonAssetLines.join('\n').trim();
+                
+                const newPrompt = assetLines 
+                  ? `${assetLines}\n\n${promptBody}` 
+                  : promptBody;
+                
+                setPrompt(newPrompt);
                 setDirty(true);
               }}
             />
             @{asset.name}
           </label>
         ))}
+        {hoveredAsset && (
+          <div className="asset-preview-popup">
+            {hoveredAsset.kind === 'image' && (
+              <img src={assetUrl(hoveredAsset.previewUrl)} alt={hoveredAsset.name} />
+            )}
+            {hoveredAsset.kind === 'video' && (
+              <video src={assetUrl(hoveredAsset.previewUrl)} muted autoPlay loop playsInline />
+            )}
+            {hoveredAsset.kind === 'audio' && (
+              <div className="asset-audio-preview">音频</div>
+            )}
+            <div className="asset-preview-name">{hoveredAsset.name}</div>
+          </div>
+        )}
+      </div>
+
+      <div className="first-frame-section">
+        <div className="section-title">
+          <Image size={16} />
+          <strong>首帧素材</strong>
+          <span className="section-hint">（只属于此分镜）</span>
+        </div>
+        {firstFrameAsset ? (
+          <div className="first-frame-preview">
+            <div className="preview-image-wrapper">
+              <img src={assetUrl(firstFrameAsset.previewUrl)} alt={firstFrameAsset.name} />
+              <span className="first-frame-badge">首帧参考</span>
+            </div>
+            <div className="preview-info">
+              <span className="asset-name">@{firstFrameAsset.name}</span>
+              <button 
+                className="small-button danger"
+                onClick={() => {
+                  setOverrides({ ...overrides, firstFrameAssetId: undefined });
+                  setFirstFrameAsset(null);
+                  setDirty(true);
+                }}
+              >
+                删除首帧素材
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="upload-area">
+            <input
+              ref={firstFrameFileInputRef}
+              type="file"
+              accept="image/*"
+              className="hidden-input"
+              onChange={async (event) => {
+                const file = event.target.files?.[0];
+                if (!file) return;
+
+                try {
+                  const base64Data = await fileToBase64(file);
+                  const data = await api<AppState>('/api/assets', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      projectId: storyboard.projectId,
+                      kind: 'image',
+                      filename: file.name,
+                      name: file.name.replace(/\.[^.]+$/u, ''),
+                      dataBase64: base64Data,
+                    }),
+                  });
+                  
+                  if (onRefresh) {
+                    await onRefresh();
+                  }
+                  
+                  const newAsset = data.inputAssets.find((a: InputAsset) => a.name === file.name.replace(/\.[^.]+$/u, ''));
+                  if (newAsset) {
+                    setFirstFrameAsset(newAsset);
+                    setOverrides({ ...overrides, firstFrameAssetId: newAsset.id });
+                    setAssetIds([...assetIds, newAsset.id]);
+                    
+                    const firstFrameLine = `@${newAsset.name} = 首帧参考`;
+                    const lines = prompt.split('\n');
+                    const hasFirstFrame = lines.some(line => line.includes('= 首帧参考'));
+                    
+                    if (!hasFirstFrame) {
+                      setPrompt(`${firstFrameLine}\n\n${prompt}`);
+                    }
+                    setDirty(true);
+                  }
+                } catch (error) {
+                  alert('上传失败: ' + (error instanceof Error ? error.message : '网络错误'));
+                }
+              }}
+            />
+            <button 
+              className="secondary upload-button"
+              onClick={() => firstFrameFileInputRef.current?.click()}
+            >
+              <Upload size={18} />
+              <span>上传首帧素材</span>
+            </button>
+          </div>
+        )}
       </div>
 
       <DefaultsForm value={mergedOptions} onChange={(value) => {
@@ -1407,6 +2009,15 @@ function SettingsView({ state, health, onSave, onHealth }: {
         setSettings({ ...settings, cliBin: event.target.value });
         setDirty(true);
       }} /></label>
+      <label>提交模式
+        <select value={settings.submitMode} onChange={(event) => {
+          setSettings({ ...settings, submitMode: event.target.value });
+          setDirty(true);
+        }}>
+          <option value="cli">CLI 模式（自动提交）</option>
+          <option value="web">网页模式（手动提交）</option>
+        </select>
+      </label>
       <div className="settings-actions">
         <button onClick={async () => {
           await onSave(settings);
@@ -1421,10 +2032,84 @@ function SettingsView({ state, health, onSave, onHealth }: {
           {health.cliAvailable && health.loginStatus === 'logged_in' ? <Check size={18} /> : <AlertCircle size={18} />}
           <div>
             <strong>{health.cliAvailable ? `CLI 可用 · ${health.loginStatus}` : 'CLI 不可用'}</strong>
+            <div style={{ marginTop: '8px', fontSize: '14px', color: '#666' }}>
+              当前模式: <span style={{ fontWeight: 'bold', color: health.submitMode === 'cli' ? '#186a63' : '#e67e22' }}>
+                {health.submitMode === 'cli' ? 'CLI 自动提交' : '网页手动提交'}
+              </span>
+            </div>
             <pre>{JSON.stringify(health.credit || health.error || health, null, 2)}</pre>
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function FrameCaptureDialog({ 
+  isOpen, 
+  onClose, 
+  frameData, 
+  asset,
+  storyboards,
+  onSaveToAssets, 
+  onSetAsFirstFrame 
+}: { 
+  isOpen: boolean; 
+  onClose: () => void; 
+  frameData: string;
+  asset: InputAsset;
+  storyboards: Storyboard[];
+  onSaveToAssets: () => void;
+  onSetAsFirstFrame: (storyboardId: string) => void;
+}) {
+  const [selectedStoryboardId, setSelectedStoryboardId] = React.useState('');
+
+  if (!isOpen || !frameData) return null;
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <strong>获取静帧</strong>
+          <button className="close-btn" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-body">
+          <div className="frame-preview">
+            <img src={frameData} alt="静帧预览" />
+          </div>
+          <div className="frame-info">
+            <p>来源: @{asset.name}</p>
+          </div>
+          <div className="frame-actions">
+            <button className="secondary" onClick={onSaveToAssets}>
+              <Save size={16} />
+              <span>保存到项目素材库</span>
+            </button>
+          </div>
+          <div className="first-frame-target">
+            <div className="section-title">
+              <Image size={16} />
+              <strong>设为分镜首帧素材</strong>
+            </div>
+            <div className="storyboard-select-row">
+              <select value={selectedStoryboardId} onChange={(e) => setSelectedStoryboardId(e.target.value)}>
+                <option value="">选择分镜...</option>
+                {storyboards.map((sb) => (
+                  <option key={sb.id} value={sb.id}>分镜 {sb.sceneNo}</option>
+                ))}
+              </select>
+              <button 
+                disabled={!selectedStoryboardId}
+                onClick={() => {
+                  if (selectedStoryboardId) onSetAsFirstFrame(selectedStoryboardId);
+                }}
+              >
+                确定
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

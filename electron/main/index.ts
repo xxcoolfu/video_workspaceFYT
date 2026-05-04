@@ -1,8 +1,9 @@
-import { app, BrowserWindow, shell, dialog } from 'electron';
+import { app, BrowserWindow, shell, dialog, ipcMain, BrowserView } from 'electron';
 import { is } from '@electron-toolkit/utils';
 import { dirname, join } from 'node:path';
 import { appendFileSync, mkdirSync } from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
+import { startJimengBridge } from '../../server/jimengBridge.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 let bridge: any = null;
@@ -16,6 +17,96 @@ function log(msg: string) {
     mkdirSync(dirname(logFilePath), { recursive: true });
     appendFileSync(logFilePath, line);
   } catch {}
+}
+
+let jimengView: BrowserView | null = null;
+
+async function openJimengBrowser(data: any) {
+  const { prompt, assets, options } = data;
+  
+  log('打开即梦网页...');
+  
+  const jimengUrl = 'https://jimeng.jianying.com';
+  
+  if (jimengView) {
+    try {
+      jimengView.webContents.loadURL(jimengUrl);
+    } catch {
+      // 忽略
+    }
+  } else {
+    jimengView = new BrowserView({
+      webPreferences: {
+        preload: join(__dirname, '../preload/index.mjs'),
+        sandbox: false,
+      },
+    });
+    
+    jimengView.webContents.loadURL(jimengUrl);
+    
+    jimengView.webContents.on('did-finish-load', () => {
+      log('即梦网页加载完成');
+      
+      const dataStr = JSON.stringify(data);
+      
+      const script = `
+        console.log('AI视频制作助手注入');
+        
+        window.fillJimengForm = function(data) {
+          const { prompt, assets, options } = data;
+          console.log('自动填充:', { prompt, options });
+          
+          const promptEditor = document.querySelector('.tiptap.ProseMirror');
+          if (promptEditor) {
+            promptEditor.focus();
+            setTimeout(() => {
+              if (window.getSelection && document.createRange) {
+                const selection = window.getSelection();
+                if (selection) {
+                  const range = document.createRange();
+                  range.selectNodeContents(promptEditor);
+                  selection.removeAllRanges();
+                  selection.addRange(range);
+                }
+              }
+              
+              document.execCommand('insertText', false, prompt);
+              console.log('提示词已插入');
+            }, 100);
+          }
+          
+          return '提示词已填充，请手动上传素材和提交';
+        };
+        
+        setTimeout(() => {
+          window.fillJimengForm(${dataStr});
+        }, 2000);
+      `;
+      
+      jimengView?.webContents.executeJavaScript(script).catch(err => log(`注入脚本失败: ${err}`));
+    });
+  }
+  
+  const jimengWindow = new BrowserWindow({
+    width: 1440,
+    height: 920,
+    title: 'AI视频制作 - 即梦',
+    show: true,
+    webPreferences: {
+      preload: join(__dirname, '../preload/index.mjs'),
+      sandbox: false,
+    },
+  });
+  
+  jimengWindow.setBrowserView(jimengView);
+  jimengView.setBounds({ x: 0, y: 0, width: 1440, height: 920 });
+  jimengWindow.setAutoResize({ width: true, height: true });
+  
+  jimengWindow.on('closed', () => {
+    jimengView = null;
+  });
+  
+  return '打开成功';
 }
 
 async function createWindow() {
@@ -45,41 +136,20 @@ async function createWindow() {
     log(`process.resourcesPath: ${process.resourcesPath}`);
     log(`app.isPackaged: ${app.isPackaged}`);
     
-    let serverPath;
-    let nodeModulesPath;
-    
-    if (is.dev) {
-      serverPath = join(__dirname, '../../server/jimengBridge.mjs');
-      nodeModulesPath = join(__dirname, '../../node_modules');
-    } else {
-      serverPath = join(process.resourcesPath, 'server/jimengBridge.mjs');
-      nodeModulesPath = join(__dirname, '../node_modules');
-    }
-    
-    log(`serverPath: ${serverPath}`);
-    log(`nodeModulesPath: ${nodeModulesPath}`);
-    
     try {
-      log('正在加载 server 模块...');
-      
-      let finalNodeModulesPath = nodeModulesPath;
+      log('正在启动 server...');
+
+      let nodeModulesPath: string | undefined;
       if (!is.dev) {
         const unpackedPath = join(process.resourcesPath, 'app.asar.unpacked/node_modules');
-        log(`unpackedPath: ${unpackedPath}`);
-        finalNodeModulesPath = `${unpackedPath};${nodeModulesPath}`;
-        log(`finalNodeModulesPath: ${finalNodeModulesPath}`);
+        const asarNodeModules = join(__dirname, '../node_modules');
+        nodeModulesPath = `${unpackedPath};${asarNodeModules}`;
+        log(`nodeModulesPath: ${nodeModulesPath}`);
       }
       
-      process.env.NODE_PATH = finalNodeModulesPath;
-      log(`NODE_PATH: ${process.env.NODE_PATH}`);
-      
-      const module = await import(pathToFileURL(serverPath).href);
-      const startJimengBridge = module.startJimengBridge;
-      
-      log('正在启动 server...');
       bridge = await startJimengBridge({ 
         port: 3210, 
-        nodeModulesPath: finalNodeModulesPath 
+        nodeModulesPath 
       });
       log(`Server 启动成功，端口: ${bridge?.port}`);
     } catch (serverError) {
@@ -118,6 +188,17 @@ async function createWindow() {
 app.whenReady().then(() => {
   log('App ready');
   createWindow();
+  
+  ipcMain.handle('open-jimeng-web', async (_, data) => {
+    log('收到打开即梦网页请求');
+    try {
+      const result = await openJimengBrowser(data);
+      return { success: true, message: result };
+    } catch (error) {
+      log(`打开失败: ${error}`);
+      return { success: false, error: String(error) };
+    }
+  });
 });
 
 app.on('window-all-closed', () => {

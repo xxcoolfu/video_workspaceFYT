@@ -3,7 +3,7 @@ export type Resolution = '480p' | '720p' | '1080p';
 export type ModelVersion = 'seedance2.0' | 'seedance2.0fast' | 'seedance2.0_vip' | 'seedance2.0fast_vip';
 export type TemplateId = 'free_text' | 'first_frame' | 'first_last_frame' | 'multi_modal_reference';
 export type AssetKind = 'image' | 'video' | 'audio';
-export type QueueStatus = 'queued' | 'submitting' | 'running' | 'retry_wait' | 'succeeded' | 'failed' | 'cancelled';
+export type QueueStatus = 'queued' | 'submitting' | 'running' | 'retry_wait' | 'web_pending' | 'succeeded' | 'failed' | 'cancelled';
 
 export type ProjectDefaults = {
   aspectRatio: AspectRatio;
@@ -12,6 +12,7 @@ export type ProjectDefaults = {
   template: TemplateId;
   durationSec: number;
   generateAudio: boolean;
+  firstFrameAssetId?: string;
 };
 
 export type Group = {
@@ -38,6 +39,7 @@ export type Storyboard = {
   overrides: Partial<ProjectDefaults>;
   assetIds: string[];
   status: QueueStatus | 'idle';
+  isContinuation: boolean;
   createdAt: string;
   updatedAt: string;
 };
@@ -82,12 +84,14 @@ export type QueueTask = {
   nextRetryAt: string;
   attemptCount: number;
   raw: unknown;
+  raw_json: string;
 };
 
 export type AppSettings = {
   materialRoot: string;
   outputRoot: string;
   cliBin: string;
+  submitMode: string;
 };
 
 export type AppState = {
